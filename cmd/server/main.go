@@ -1,7 +1,15 @@
 package main
 
-import "fmt"
+import (
+	"log"
+	"net/http"
+
+	"rdpAiAnswer/internal/signaling"
+)
 
 func main() {
-	fmt.Println("rdp-server starting")
+	reg := signaling.NewRegistry()
+	handler := signaling.NewHandler(reg)
+	log.Println("rdp-server listening on :9000")
+	log.Fatal(http.ListenAndServe(":9000", handler))
 }
