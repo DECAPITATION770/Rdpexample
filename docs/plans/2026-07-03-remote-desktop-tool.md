@@ -846,6 +846,9 @@ func ParseCombo(s string) (Combo, error) {
 	if key == "" {
 		return Combo{}, errors.New("hotkey: missing key")
 	}
+	if key == "Ctrl" || key == "Alt" || key == "Shift" {
+		return Combo{}, errors.New("hotkey: combo must end in a non-modifier key")
+	}
 	c.Key = key
 	for _, mod := range parts[:len(parts)-1] {
 		switch mod {
