@@ -1071,6 +1071,7 @@ package webrtcconn
 
 import (
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -1082,40 +1083,48 @@ import (
 // Both Host and Viewer use this same type; whichever side calls
 // CreateOffer first is the offerer.
 type Peer struct {
-	pc         *webrtc.PeerConnection
-	dc         *webrtc.DataChannel
-	onData     func([]byte)
-	connected  chan struct{}
-	connectedC bool
+	pc     *webrtc.PeerConnection
+	dc     *webrtc.DataChannel
+	onData func([]byte)
+
+	dcOpenOnce sync.Once
+	dcOpen     chan struct{}
 }
 
-// iceServers of nil means host-candidates-only (fine for same-machine
-// tests; production callers pass STUN/TURN URLs from config).
+// NewPeer creates a Peer. iceServers of nil means host-candidates-only
+// (fine for same-machine tests; production callers pass STUN/TURN URLs
+// from config).
 func NewPeer(iceServers []webrtc.ICEServer) (*Peer, error) {
 	config := webrtc.Configuration{ICEServers: iceServers}
 	pc, err := webrtc.NewPeerConnection(config)
 	if err != nil {
 		return nil, err
 	}
-	p := &Peer{pc: pc, connected: make(chan struct{})}
-
-	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		if s == webrtc.PeerConnectionStateConnected && !p.connectedC {
-			p.connectedC = true
-			close(p.connected)
-		}
-	})
+	p := &Peer{pc: pc, dcOpen: make(chan struct{})}
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		p.dc = dc
-		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			if p.onData != nil {
-				p.onData(msg.Data)
-			}
-		})
+		p.attachDataChannel(dc)
 	})
 
 	return p, nil
+}
+
+// attachDataChannel wires OnOpen/OnMessage for a DataChannel obtained
+// either from CreateDataChannel (offerer) or OnDataChannel (answerer).
+// PeerConnectionState can report "connected" slightly before the
+// DataChannel's own SCTP stream finishes opening — sending before OnOpen
+// fires returns "io: read/write on closed pipe" — so WaitConnected below
+// waits on dcOpen rather than on connection state.
+func (p *Peer) attachDataChannel(dc *webrtc.DataChannel) {
+	p.dc = dc
+	dc.OnOpen(func() {
+		p.dcOpenOnce.Do(func() { close(p.dcOpen) })
+	})
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if p.onData != nil {
+			p.onData(msg.Data)
+		}
+	})
 }
 
 func (p *Peer) OnData(fn func([]byte)) { p.onData = fn }
@@ -1125,12 +1134,7 @@ func (p *Peer) CreateOffer() (webrtc.SessionDescription, error) {
 	if err != nil {
 		return webrtc.SessionDescription{}, err
 	}
-	p.dc = dc
-	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if p.onData != nil {
-			p.onData(msg.Data)
-		}
-	})
+	p.attachDataChannel(dc)
 
 	offer, err := p.pc.CreateOffer(nil)
 	if err != nil {
@@ -1166,10 +1170,10 @@ func (p *Peer) AcceptAnswer(answer webrtc.SessionDescription) error {
 
 func (p *Peer) WaitConnected(timeout time.Duration) error {
 	select {
-	case <-p.connected:
+	case <-p.dcOpen:
 		return nil
 	case <-time.After(timeout):
-		return errors.New("webrtcconn: timed out waiting for connection")
+		return errors.New("webrtcconn: timed out waiting for data channel to open")
 	}
 }
 
