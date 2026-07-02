@@ -3,8 +3,8 @@ package signaling
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+	"sync"
 
 	"github.com/gorilla/websocket"
 	"rdpAiAnswer/internal/proto"
@@ -17,15 +17,26 @@ var upgrader = websocket.Upgrader{
 // Handler routes host and viewer WebSocket connections. Host connections
 // register themselves and stay open (registration lives as long as the
 // socket does). Viewer connections request the session list and relay
-// SDP/ICE messages to a specific host by session ID.
+// SDP/ICE messages to a specific host by session ID; the handler records
+// which viewer socket is talking to which session (from the SessionID on
+// its first offer/ICE message) so the host's replies can be relayed back
+// to the right viewer. Only one active viewer per session is tracked at a
+// time, matching the MVP's one-admin-at-a-time design.
 type Handler struct {
-	reg   *Registry
-	mux   *http.ServeMux
-	hosts map[string]*websocket.Conn // sessionID -> host socket, for relay
+	mu      sync.Mutex
+	reg     *Registry
+	mux     *http.ServeMux
+	hosts   map[string]*websocket.Conn // sessionID -> host socket
+	viewers map[string]*websocket.Conn // sessionID -> viewer socket
 }
 
 func NewHandler(reg *Registry) *Handler {
-	h := &Handler{reg: reg, mux: http.NewServeMux(), hosts: make(map[string]*websocket.Conn)}
+	h := &Handler{
+		reg:     reg,
+		mux:     http.NewServeMux(),
+		hosts:   make(map[string]*websocket.Conn),
+		viewers: make(map[string]*websocket.Conn),
+	}
 	h.mux.HandleFunc("/ws/host", h.handleHost)
 	h.mux.HandleFunc("/ws/viewer", h.handleViewer)
 	return h
@@ -33,6 +44,36 @@ func NewHandler(reg *Registry) *Handler {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
+}
+
+func (h *Handler) setHost(sessionID string, conn *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.hosts[sessionID] = conn
+}
+
+func (h *Handler) removeHost(sessionID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.hosts, sessionID)
+}
+
+func (h *Handler) setViewer(sessionID string, conn *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.viewers[sessionID] = conn
+}
+
+func (h *Handler) hostConn(sessionID string) *websocket.Conn {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.hosts[sessionID]
+}
+
+func (h *Handler) viewerConn(sessionID string) *websocket.Conn {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.viewers[sessionID]
 }
 
 func (h *Handler) handleHost(w http.ResponseWriter, r *http.Request) {
@@ -48,7 +89,7 @@ func (h *Handler) handleHost(w http.ResponseWriter, r *http.Request) {
 		if err := conn.ReadJSON(&env); err != nil {
 			if sessionID != "" {
 				h.reg.Unregister(sessionID)
-				delete(h.hosts, sessionID)
+				h.removeHost(sessionID)
 			}
 			return
 		}
@@ -59,11 +100,12 @@ func (h *Handler) handleHost(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			sessionID = h.reg.Register(reg.Name)
-			h.hosts[sessionID] = conn
+			h.setHost(sessionID, conn)
 		case proto.MsgAnswer, proto.MsgICECandidate:
-			// relayed on to the viewer in a later task once we track
-			// per-viewer connections; logged for now.
-			log.Printf("host %s sent %s (relay wiring added in Task 7/webrtcconn integration)", sessionID, env.Type)
+			env.SessionID = sessionID
+			if viewer := h.viewerConn(sessionID); viewer != nil {
+				_ = viewer.WriteJSON(env)
+			}
 		}
 	}
 }
@@ -86,7 +128,10 @@ func (h *Handler) handleViewer(w http.ResponseWriter, r *http.Request) {
 			payload, _ := json.Marshal(list)
 			_ = conn.WriteJSON(proto.Envelope{Type: proto.MsgSessionList, Payload: payload})
 		case proto.MsgOffer, proto.MsgICECandidate:
-			log.Printf("viewer sent %s for session %s (relay wiring added in Task 7)", env.Type, env.SessionID)
+			h.setViewer(env.SessionID, conn)
+			if host := h.hostConn(env.SessionID); host != nil {
+				_ = host.WriteJSON(env)
+			}
 		}
 	}
 }
