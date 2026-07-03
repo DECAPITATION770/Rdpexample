@@ -40,9 +40,8 @@ func rgb(r, g, b byte) uint32 {
 }
 
 var (
-	textColor       = rgb(255, 255, 255) // white
-	shadowColor     = rgb(0, 0, 0)       // black, offset behind the text for legibility
-	backgroundColor = rgb(0, 0, 0)       // color-keyed fully transparent — no visible box
+	shadowColor     = rgb(0, 0, 0) // black, offset behind the text for legibility
+	backgroundColor = rgb(0, 0, 0) // color-keyed fully transparent — no visible box
 )
 
 var (
@@ -121,15 +120,23 @@ type wndClassExW struct {
 
 const className = "RDPToolOverlayWindow"
 
+// overlayWindowState is the per-window data the shared window procedure
+// needs to paint on WM_PAINT — text and its color, since each message
+// can request its own.
+type overlayWindowState struct {
+	text  string
+	color uint32 // Windows COLORREF (0x00BBGGRR), see rgb()
+}
+
 var (
 	registerOnce sync.Once
 	registerErr  error
 
-	// windowTexts holds the message text for each live overlay hwnd,
+	// windowStates holds the text/color for each live overlay hwnd,
 	// looked up by the shared window procedure on WM_PAINT. A real Win32
 	// union/GWLP_USERDATA slot would also work, but a map keyed by hwnd
 	// is simpler to get right without more unsafe pointer juggling.
-	windowTexts sync.Map // uintptr(hwnd) -> string
+	windowStates sync.Map // uintptr(hwnd) -> overlayWindowState
 )
 
 func registerClass() error {
@@ -166,7 +173,7 @@ var windowProcCallback = syscall.NewCallback(func(hwnd uintptr, msg uint32, wpar
 		paintOverlay(hwnd)
 		return 0
 	case wmNCDestroy:
-		windowTexts.Delete(hwnd)
+		windowStates.Delete(hwnd)
 		return 0
 	}
 	ret, _, _ := procDefWindowProc.Call(hwnd, uintptr(msg), wparam, lparam)
@@ -178,9 +185,9 @@ func paintOverlay(hwnd uintptr) {
 	hdc, _, _ := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 	defer procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 
-	text, _ := windowTexts.Load(hwnd)
-	s, _ := text.(string)
-	textPtr, textLen, err := utf16PtrAndLen(s)
+	stateVal, _ := windowStates.Load(hwnd)
+	state, _ := stateVal.(overlayWindowState)
+	textPtr, textLen, err := utf16PtrAndLen(state.text)
 	if err != nil {
 		return
 	}
@@ -194,7 +201,7 @@ func paintOverlay(hwnd uintptr) {
 	procDrawText.Call(hdc, uintptr(unsafe.Pointer(textPtr)), uintptr(textLen), uintptr(unsafe.Pointer(&shadowRect)), dtSingleLine|dtNoClip)
 
 	mainRect := rect{Left: 0, Top: 0, Right: ps.RCPaint.Right, Bottom: ps.RCPaint.Bottom}
-	procSetTextColor.Call(hdc, uintptr(textColor))
+	procSetTextColor.Call(hdc, uintptr(state.color))
 	procDrawText.Call(hdc, uintptr(unsafe.Pointer(textPtr)), uintptr(textLen), uintptr(unsafe.Pointer(&mainRect)), dtSingleLine|dtNoClip)
 }
 
@@ -225,8 +232,9 @@ func measureText(s string) (width, height int32, err error) {
 
 // createOverlayWindow registers the shared window class on first use,
 // measures the text to size the window, and creates a borderless,
-// click-through, always-on-top popup window near (x, y) showing it.
-func createOverlayWindow(text string, x, y int32) (uintptr, error) {
+// click-through, always-on-top popup window near (x, y) showing it in
+// the given color.
+func createOverlayWindow(text string, color uint32, x, y int32) (uintptr, error) {
 	if err := registerClass(); err != nil {
 		return 0, err
 	}
@@ -259,16 +267,17 @@ func createOverlayWindow(text string, x, y int32) (uintptr, error) {
 		return 0, callErr
 	}
 
-	windowTexts.Store(hwnd, text)
+	windowStates.Store(hwnd, overlayWindowState{text: text, color: color})
 	return hwnd, nil
 }
 
 // ShowMessage creates a click-through layered window near the current
-// cursor position showing text, fades it out over fadeDuration using
-// FadeTimer, and destroys it when done. Blocks the calling goroutine for
-// the duration of the fade — callers should run this in its own
-// goroutine per incoming overlay message.
-func ShowMessage(text string, fadeDuration time.Duration) error {
+// cursor position showing text in hexColor ("#RRGGBB"; empty or
+// malformed falls back to white via ParseHexColor), fades it out over
+// fadeDuration using FadeTimer, and destroys it when done. Blocks the
+// calling goroutine for the duration of the fade — callers should run
+// this in its own goroutine per incoming overlay message.
+func ShowMessage(text string, fadeDuration time.Duration, hexColor string) error {
 	// A window's message queue is thread-affine in Win32: only the
 	// thread that created the window can pump messages for it via
 	// PeekMessage/DispatchMessage. Go goroutines aren't pinned to an OS
@@ -286,7 +295,8 @@ func ShowMessage(text string, fadeDuration time.Duration) error {
 	var cursor point
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&cursor)))
 
-	hwnd, err := createOverlayWindow(text, cursor.X, cursor.Y)
+	r, g, b, _ := ParseHexColor(hexColor) // falls back to white on empty/malformed
+	hwnd, err := createOverlayWindow(text, rgb(r, g, b), cursor.X, cursor.Y)
 	if err != nil {
 		return err
 	}

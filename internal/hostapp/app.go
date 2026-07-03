@@ -390,7 +390,7 @@ func showOverlayMessage(m proto.OverlayMessage) {
 	}
 	fade := time.Duration(m.FadeSeconds * float64(time.Second))
 	go func() {
-		if err := overlay.ShowMessage(m.Text, fade); err != nil {
+		if err := overlay.ShowMessage(m.Text, fade, m.Color); err != nil {
 			log.Printf("hostapp: overlay.ShowMessage failed: %v", err)
 		}
 	}()

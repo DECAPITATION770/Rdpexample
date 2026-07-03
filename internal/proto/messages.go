@@ -111,6 +111,7 @@ type InputEvent struct {
 type OverlayMessage struct {
 	Text        string  `json:"text"`
 	FadeSeconds float64 `json:"fade_seconds"`
+	Color       string  `json:"color,omitempty"` // "#RRGGBB"; empty or malformed falls back to white
 }
 
 func (o OverlayMessage) Validate() error {
