@@ -94,6 +94,8 @@ func Run(cfg Config) error {
 	}
 	log.Printf("hostapp: registered as %q, waiting for viewers", cfg.Name)
 
+	bounds := &screenBounds{}
+
 	for {
 		var env proto.Envelope
 		if err := conn.ReadJSON(&env); err != nil {
@@ -102,9 +104,23 @@ func Run(cfg Config) error {
 
 		switch env.Type {
 		case proto.MsgOffer:
-			go handleOffer(conn, cfg, env)
+			go handleOffer(conn, cfg, env, bounds)
 		case proto.MsgRequestScreenshot:
 			go handleScreenshotRequest(conn, env)
+		case proto.MsgInputEvent:
+			var evt proto.InputEvent
+			if err := json.Unmarshal(env.Payload, &evt); err != nil {
+				log.Printf("hostapp: bad relayed input event: %v", err)
+				continue
+			}
+			applyInputEvent(evt, bounds)
+		case proto.MsgOverlayMessage:
+			var msg proto.OverlayMessage
+			if err := json.Unmarshal(env.Payload, &msg); err != nil {
+				log.Printf("hostapp: bad relayed overlay message: %v", err)
+				continue
+			}
+			showOverlayMessage(msg)
 		default:
 			// MsgICECandidate is relayed by the signaling server but
 			// unused here: webrtcconn.Peer waits for full ICE gathering
@@ -146,7 +162,7 @@ type screenBounds struct {
 	height atomic.Int32
 }
 
-func handleOffer(signaling *safeConn, cfg Config, env proto.Envelope) {
+func handleOffer(signaling *safeConn, cfg Config, env proto.Envelope, bounds *screenBounds) {
 	var sdpMsg proto.SDPMessage
 	if err := json.Unmarshal(env.Payload, &sdpMsg); err != nil {
 		log.Printf("hostapp: bad offer payload for session %s: %v", env.SessionID, err)
@@ -183,7 +199,6 @@ func handleOffer(signaling *safeConn, cfg Config, env proto.Envelope) {
 	}
 	log.Printf("hostapp: session %s connected", env.SessionID)
 
-	bounds := &screenBounds{}
 	peer.OnData(func(data []byte) { handleDataChannelMessage(data, bounds) })
 
 	runCaptureLoop(peer, cfg, bounds)
@@ -268,17 +283,25 @@ func handleDataChannelMessage(data []byte, bounds *screenBounds) {
 	case proto.InputEvent:
 		applyInputEvent(m, bounds)
 	case proto.OverlayMessage:
-		if err := m.Validate(); err != nil {
-			log.Printf("hostapp: invalid overlay message: %v", err)
-			return
-		}
-		fade := time.Duration(m.FadeSeconds * float64(time.Second))
-		go func() {
-			if err := overlay.ShowMessage(m.Text, fade); err != nil {
-				log.Printf("hostapp: overlay.ShowMessage failed: %v", err)
-			}
-		}()
+		showOverlayMessage(m)
 	}
+}
+
+// showOverlayMessage validates and displays an overlay message on the
+// host's screen, fading it out after the requested duration. Shared by
+// both the WebRTC DataChannel path (handleDataChannelMessage) and the
+// relayed-over-signaling-WebSocket path (Run's MsgOverlayMessage case).
+func showOverlayMessage(m proto.OverlayMessage) {
+	if err := m.Validate(); err != nil {
+		log.Printf("hostapp: invalid overlay message: %v", err)
+		return
+	}
+	fade := time.Duration(m.FadeSeconds * float64(time.Second))
+	go func() {
+		if err := overlay.ShowMessage(m.Text, fade); err != nil {
+			log.Printf("hostapp: overlay.ShowMessage failed: %v", err)
+		}
+	}()
 }
 
 // applyInputEvent maps a proto.InputEvent onto internal/input's Win32
