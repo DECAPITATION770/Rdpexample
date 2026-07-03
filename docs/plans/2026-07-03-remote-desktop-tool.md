@@ -2,17 +2,17 @@
 
 > **For Claude:** Use `${SUPERPOWERS_SKILLS_ROOT}/skills/collaboration/executing-plans/SKILL.md` to implement this plan task-by-task.
 
-**Goal:** Build a minimal Windows-only remote-desktop tool in Go: a signaling/relay server (deployed on the user's VPS) plus a Host agent and a Viewer app that connect P2P over WebRTC, with view+control, a safety toggle for mouse/keyboard input, and a fading on-screen text overlay the admin can push to the host's cursor.
+**Goal:** Build a minimal Windows-only remote-desktop tool in Go: a signaling/relay server (deployed on the user's VPS) plus a Host agent (native Windows) and a browser-based admin UI that connect P2P over WebRTC, with view+control, a safety toggle for mouse/keyboard input, and a fading on-screen text overlay the admin can push to the host's cursor.
 
-**Architecture:** Three binaries share one Go module. `cmd/server` is a WebSocket signaling server (session registry + SDP/ICE relay) that runs on Linux (the VPS), alongside a standard `coturn` TURN/STUN server for NAT traversal. `cmd/host` and `cmd/viewer` run on Windows, connect out to the signaling server, negotiate a `pion/webrtc` PeerConnection per session, and exchange screen frames (JPEG over an unreliable DataChannel) and control messages (input events, overlay text) over a second reliable DataChannel. All Windows-native functionality (screen capture, input injection, the layered overlay window) is implemented with direct `golang.org/x/sys/windows` syscalls — no cgo — so both Windows binaries can be cross-compiled from any OS. The Viewer's GUI is built with Fyne, which *does* require cgo/OpenGL, so it needs `fyne-cross` (Docker) or a native Windows build machine — this is called out explicitly in Task 1.
+**Architecture:** `cmd/server` is a WebSocket signaling server (session registry + SDP/ICE relay) that also serves a single-page admin UI (`internal/webui`, embedded via `go:embed`) — it runs on Linux (the VPS), alongside a standard `coturn` TURN/STUN server for NAT traversal. `cmd/host` runs on Windows, connects out to the signaling server, negotiates a `pion/webrtc` PeerConnection per admin session, and exchanges screen frames (JPEG) and control messages (input events, overlay text) over a DataChannel. The admin side is just a browser tab pointed at the signaling server's `/` — it uses the browser's native `RTCPeerConnection`/`RTCDataChannel`, so no Go GUI toolkit or cross-compiled client is needed for it at all (see the "Tasks 12-13" section below for why this replaced an originally-planned Fyne desktop app). All Windows-native functionality (screen capture, input injection, the layered overlay window) is implemented with direct `golang.org/x/sys/windows` syscalls — no cgo — so `cmd/host` cross-compiles from any OS.
 
-**Tech Stack:** Go 1.26, `github.com/pion/webrtc/v4`, `github.com/gorilla/websocket`, `fyne.io/fyne/v2`, `github.com/kbinani/screenshot`, `golang.org/x/sys/windows`, `coturn` (system package, not Go code).
+**Tech Stack:** Go 1.26, `github.com/pion/webrtc/v4`, `github.com/gorilla/websocket`, `github.com/kbinani/screenshot`, `golang.org/x/sys/windows`, plain HTML/CSS/JS for the admin UI, `coturn` (system package, not Go code).
 
 ---
 
 ## Important constraint to resolve before Task 8
 
-You are developing on **macOS (darwin/arm64)**. `cmd/server` is pure Go and cross-compiles trivially (`GOOS=linux go build`). `cmd/host` and `cmd/viewer` use `golang.org/x/sys/windows` syscalls only — also cross-compiles fine with plain `GOOS=windows GOARCH=amd64 go build`, no cgo needed. **However**, `cmd/viewer` depends on Fyne, which uses cgo + OpenGL bindings. Cross-compiling a cgo binary for Windows from macOS requires a mingw-w64 toolchain — Task 1 sets this up via `fyne-cross` (Docker-based), which is the realistic path unless you have a physical/VM Windows machine to build on directly. Confirm Docker Desktop is installed before Task 1, or plan to do final Viewer builds on a Windows box.
+You are developing on **macOS (darwin/arm64)**. `cmd/server` is pure Go and cross-compiles trivially (`GOOS=linux go build`). `cmd/host` uses `golang.org/x/sys/windows` syscalls only — also cross-compiles fine with plain `GOOS=windows GOARCH=amd64 go build`, no cgo needed. There is no cgo dependency anywhere in this project (the admin UI is a browser page, not a compiled client), so there is no Docker/`fyne-cross`/Windows-build-machine requirement at all — this constraint section is kept only as a historical note, since Task 1 originally hit exactly this problem with a Fyne-based viewer before that approach was replaced (see the "Tasks 12-13" section).
 
 ---
 
@@ -1638,130 +1638,31 @@ git commit -m "feat: wire host agent — capture, input injection, overlay, sign
 
 ---
 
-### Task 12: Viewer session list screen (Fyne)
+### Tasks 12-13 (superseded): Viewer UI — web admin instead of Fyne desktop app
 
-**Files:**
-- Create: `internal/viewerapp/sessionlist.go`
-- Modify: `cmd/viewer/main.go`
+**Original plan:** a Fyne desktop app (`cmd/viewer`) with a session-list window and a control window (video canvas, mouse/keyboard toggles, hotkey rebind, overlay message form).
 
-**Step 1: Implement the session list window**
+**What actually shipped instead:** partway through Task 13 (after the session list screen was already built and working in Fyne), we hit two compounding problems with the Fyne path — (1) Task 1 had already found `fyne-cross`'s Docker image stuck on an older Go toolchain than this project's `go.mod` requires, so Windows builds of the Viewer had no working path from macOS without a real Windows box; (2) Fyne's desktop key-event API has no per-event modifier field, so hotkey rebind capture required manually tracking `LeftControl`/`RightControl`/etc. down/up state — solvable, but fiddly, for something a browser gives for free via `event.ctrlKey`/`altKey`/`shiftKey`.
 
-```go
-// internal/viewerapp/sessionlist.go
-package viewerapp
+Since the signaling protocol (`internal/proto`, WebSocket JSON envelopes + length-prefixed DataChannel frames) is transport-agnostic and browsers have native `RTCPeerConnection`/`RTCDataChannel` support, we replaced the whole Viewer with **one static HTML file, served directly by the signaling server**, and deleted `cmd/viewer` and `internal/viewerapp` entirely. No Go GUI toolkit, no cross-compile step, no Docker — open a browser tab and it works on any OS, including the admin's own machine regardless of platform.
 
-import (
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/widget"
+**Files (as built):**
+- `internal/webui/admin.html` — the single page: session list view + control view (video `<canvas>`, mouse/keyboard toggles with hotkey labels + rebind buttons, message form with a 0.1-step fade-seconds input defaulting to `2.0`). Internally organized into a `SignalingClient` class (owns the one WebSocket to `/ws/viewer`, since a socket only supports one reader), a `RemoteSession` class (one `RTCPeerConnection` + `RTCDataChannel` per connected host, non-trickle ICE to match `internal/webrtcconn.Peer`'s behavior — both sides wait for full ICE gathering before exchanging SDP, so `ice_candidate` messages go unused by design), and plain event-listener wiring for the rest.
+- `internal/webui/webui.go` — `//go:embed admin.html` plus an `http.HandlerFunc` that serves it with the right content type.
+- `cmd/server/main.go` — mounts `webui.Handler()` at `/` alongside the existing signaling handler at `/ws/`.
+- `Makefile` — dropped the `viewer`/`viewer-cross` targets (nothing to build for the web UI).
 
-	"rdpAiAnswer/internal/proto"
-)
+**Wire-protocol details worth knowing if you touch this:**
+- `proto.Envelope.Payload` is `json.RawMessage`, which Go's `encoding/json` embeds as a nested JSON value — **not** base64. JS just reads `env.payload.sdp` etc. directly after `JSON.parse`.
+- `proto.ScreenFrame.JPEG` is `[]byte`, which Go *does* base64-encode automatically — JS builds an `<img>` from `"data:image/jpeg;base64," + frame.jpeg` and draws it onto the canvas once loaded, resizing the canvas to the image's natural dimensions.
+- DataChannel frames use the same `[1-byte kind][4-byte big-endian length][JSON]` framing as the Go side (`internal/proto.EncodeFrame`/`DecodeFrame`); the HTML file has matching `encodeFrame`/`decodeFrame` JS functions using `DataView`.
+- Mouse coordinates are sent in the *canvas's* pixel space (which is set to the JPEG's natural width/height each frame), scaled from the browser's CSS pixel space via `getBoundingClientRect()` — this lines up with `internal/input.MoveMouse`'s normalization against the primary display on the host side, since the host only ever captures and reports its primary display's own resolution.
+- Keyboard forwarding maps `KeyboardEvent.code` to Windows virtual-key codes via a hardcoded `CODE_TO_VK` table (US layout only for the MVP) matching `internal/input.KeyPress`'s expected `uint16` VK codes.
+- Hotkey combos are persisted in `localStorage` (`rdp.mouseCombo` / `rdp.kbCombo`) as `{ctrl, alt, shift, code}`, defaulting to `Ctrl+Alt+M` / `Ctrl+Alt+K`. Rebind mode ignores modifier-only keydowns (mirrors `internal/hotkey.ParseCombo`'s rule that a combo needs a non-modifier key) and waits for the next real key.
 
-// ShowSessionList opens the main window: a refreshable list of online
-// hosts fetched from the signaling server, opening a control window
-// (Task 13) on click.
-func ShowSessionList(fyneApp fyne.App, signalingURL string) {
-	w := fyneApp.NewWindow("RDP-Tool — Sessions")
+**Verification performed:** a throwaway Go "fake host" (using the already-tested `internal/webrtcconn.Peer`, not committed to the repo) was registered against a locally running `cmd/server`, then driven end-to-end via Playwright against a real Chromium instance: session list fetch, WebRTC connect, live JPEG video rendering on the canvas, mouse-move with correct coordinate scaling (verified exact pixel values), hotkey toggling the mouse checkbox on/off, and an overlay message (`"привет"`, fade `1.5`) round-tripping with the exact text and fade value intact. This is a stronger verification than Task 12/13 originally could get for the Fyne app, which had no way to be driven headlessly.
 
-	list := widget.NewList(
-		func() int { return len(currentSessions) },
-		func() fyne.CanvasObject { return widget.NewLabel("") },
-		func(i widget.ListItemID, o fyne.CanvasObject) {
-			o.(*widget.Label).SetText(currentSessions[i].Name)
-		},
-	)
-	list.OnSelected = func(i widget.ListItemID) {
-		OpenControlWindow(fyneApp, signalingURL, currentSessions[i])
-	}
-
-	refresh := widget.NewButton("Refresh", func() {
-		fetchSessions(signalingURL)
-		list.Refresh()
-	})
-
-	w.SetContent(container.NewBorder(nil, refresh, nil, nil, list))
-	w.Resize(fyne.NewSize(400, 300))
-	w.Show()
-}
-
-var currentSessions []proto.SessionInfo
-
-func fetchSessions(signalingURL string) {
-	// Dial signalingURL + "/ws/viewer", send MsgListSessions, read
-	// MsgSessionList response, assign to currentSessions. Keep the
-	// connection open and store it for reuse by Task 13 (the control
-	// window reuses this same WS connection to send MsgOffer for the
-	// selected session rather than opening a second one).
-}
-```
-
-**Step 2: Wire `cmd/viewer/main.go`**
-
-```go
-package main
-
-import (
-	"flag"
-
-	"fyne.io/fyne/v2/app"
-	"rdpAiAnswer/internal/viewerapp"
-)
-
-func main() {
-	server := flag.String("server", "ws://localhost:9000", "signaling server base URL")
-	flag.Parse()
-
-	a := app.New()
-	viewerapp.ShowSessionList(a, *server)
-	a.Run()
-}
-```
-
-**Step 3: Manual verification**
-
-Run `make viewer` (native build is enough to check the UI renders — full Windows behavior is checked once cross-compiled via `fyne-cross` per Task 1). Start `bin/rdp-server` and a fake host registration (reuse the throwaway test client from Task 11), click "Refresh", confirm the session appears in the list.
-
-**Step 4: Commit**
-
-```bash
-git add internal/viewerapp cmd/viewer/main.go
-git commit -m "feat: add Fyne session list screen"
-```
-
----
-
-### Task 13: Viewer control window (video + toggles + hotkey rebind + message form)
-
-**Files:**
-- Create: `internal/viewerapp/controlwindow.go`
-
-**Step 1: Implement the control window**
-
-Structure, matching the approved wireframe:
-- Left: `canvas.Image` updated on each incoming `proto.ScreenFrame` (decode JPEG bytes to `image.Image`, `canvas.NewImageFromImage`, `img.Refresh()`).
-- Right sidebar: two `widget.Check` toggles ("Mouse", "Keyboard"), each defaulting to **off**, each with a small label below showing the current `hotkey.Combo.String()` and a "Rebind" button.
-- Rebind flow: clicking "Rebind" sets a `awaitingRebind *string` flag naming which toggle is being rebound; the window's `Canvas().SetOnTypedKey`/`(desktop.Canvas).SetOnKeyDown` handler, when `awaitingRebind != nil`, builds a `hotkey.Combo` from the current modifier state + key, calls `hotkey.ParseCombo`-compatible construction, stores it, clears `awaitingRebind`, updates the label.
-- Message form: `widget.Entry` for text, a numeric stepper for fade seconds (use `widget.NewEntry` + validator restricting to one decimal, or `widget.NewSlider` with 0.1 step if Fyne's widget set at your installed version has a suitable numeric stepper — check `fyne.io/fyne/v2/widget` docs for the exact API available in your `go.mod` version) defaulting to `2.0`, "Send" button building a `proto.OverlayMessage{Text: ..., FadeSeconds: ...}`, calling `.Normalize()`, `.Validate()`, and on success `proto.EncodeFrame` + `Peer.Send`.
-- When a toggle is on, the window's mouse-move/click/key handlers (Fyne's `desktop.Mouseable`/`desktop.Hoverable` or a raw `canvas.Image` wrapped with a custom `fyne.CanvasObject` implementing `Dragged`/`Tapped`) build `proto.InputEvent`s and send them over the Peer.
-
-**Step 2: Manual verification (end-to-end, needs two Windows machines/VMs on different networks + the VPS running `cmd/server` and `coturn`)**
-
-1. Start `rdp-server` and `coturn` on the VPS (Task 15).
-2. Run `rdp-host.exe` on Host machine.
-3. Run `rdp-viewer.exe` on Admin machine, click the session, confirm the screen appears.
-4. Toggle "Mouse" on, move mouse over the video, confirm the Host's cursor follows.
-5. Toggle "Keyboard" on, type, confirm keystrokes land on the Host.
-6. Click "Rebind" under Mouse, press a new combo, confirm the label updates and the old combo no longer toggles it.
-7. Type a message, set fade to `2.0`, click Send, confirm text appears at the Host's cursor, borderless, on top, click-through, and fades out in ~2 seconds.
-
-**Step 3: Commit**
-
-```bash
-git add internal/viewerapp/controlwindow.go
-git commit -m "feat: add viewer control window with input toggles, hotkey rebind, overlay messaging"
-```
+**Still needs real-machine verification:** the *host* side (screen capture, `SendInput`, the layered overlay window — Tasks 8-10) can only be verified on an actual Windows machine, same as before; nothing about this substitution changes that.
 
 ---
 
@@ -1771,14 +1672,14 @@ git commit -m "feat: add viewer control window with input toggles, hotkey rebind
 - Create: `docs/deploy/vps-setup.md`
 
 **Step 1: Write deployment doc covering:**
-- Building `rdp-server` for Linux (`make server`), copying to VPS, running as a `systemd` service on port 9000 (behind TLS via a reverse proxy like Caddy/nginx for `wss://`, since browsers/Fyne's websocket client will be happier with TLS and it's needed for the P2P handshake to traverse some corporate proxies anyway).
+- Building `rdp-server` for Linux (`make server`), copying to VPS, running as a `systemd` service on port 9000 (behind TLS via a reverse proxy like Caddy/nginx for `wss://` — needed for browsers to allow WebRTC/WebSocket from a page served over HTTPS, and it's needed for the P2P handshake to traverse some corporate proxies anyway). The admin UI is served from this same port/binary (`internal/webui`), so there's nothing extra to deploy for it — visiting `https://<vps>/` in a browser is the whole admin client.
 - Installing `coturn` (`apt install coturn`), minimal `/etc/turnserver.conf`: `listening-port=3478`, `fingerprint`, `lt-cred-mech`, a static `user=rdp:<password>`, `realm=<vps-ip-or-domain>`. Enable and start the systemd service.
-- The exact `webrtc.ICEServer` values `cmd/host`/`cmd/viewer` need to pass into `webrtcconn.NewPeer` (`stun:<vps>:3478` and `turn:<vps>:3478` with the configured username/credential) — wire these as `-ice-server` flags on both binaries rather than hardcoding.
+- The exact ICE server values needed on both sides: `cmd/host`'s `-ice-servers` flag (`stun:<vps>:3478,turn:<vps>:3478`, per `hostapp.Config.ICEServers`) and the admin page's `RemoteSession` constructor, which currently hardcodes `iceServers: []` in `internal/webui/admin.html` — change that to the same STUN/TURN URLs (with `username`/`credential` for the TURN entry) before relying on NAT traversal outside a LAN.
 
 **Step 2: Deploy and smoke-test**
 
 Run: from the VPS, `systemctl status rdp-server coturn` — both `active (running)`.
-Expected output confirms both services up; then re-run Task 13's end-to-end checklist using the real VPS `wss://` URL instead of `localhost`.
+Expected output confirms both services up; then re-run the Tasks 12-13 end-to-end checklist (session list → connect → video → mouse/keyboard toggle → overlay message) against the real VPS `https://`/`wss://` URL instead of `localhost`, from an admin browser on a different network than the Host.
 
 **Step 3: Commit**
 
@@ -1791,4 +1692,4 @@ git commit -m "docs: add VPS deployment guide for signaling + TURN server"
 
 ## Summary of what's genuinely hard here
 
-Tasks 2–7 (protocol, registry, signaling server, hotkey parser, fade timer, WebRTC peer helper) are ordinary Go, fully unit-tested, and should go quickly for someone at your level. Tasks 8–10 (native Windows capture/input/overlay) and Task 13 (Fyne control window with live video + custom input capture) are where most of the real time goes — they're un-unit-testable, Windows-only, and Task 10 in particular involves raw Win32 window-class boilerplate that Go has no shortcuts for. Realistically this is **several focused days**, not hours, concentrated almost entirely in the native-Windows and Fyne-GUI tasks rather than the networking/protocol layer.
+Tasks 2–7 (protocol, registry, signaling server, hotkey parser, fade timer, WebRTC peer helper) are ordinary Go, fully unit-tested. Tasks 8–10 (native Windows capture/input/overlay) are where most of the real remaining risk lives — they're un-unit-testable from macOS, Windows-only, and Task 10 in particular involves raw Win32 window-class boilerplate that Go has no shortcuts for; all three compile and pass `go vet` for the Windows target but have only been exercised via cross-compilation, not on a real Windows machine. The admin UI (Tasks 12-13) turned out to be the *easy* part once moved to a browser — it was fully verified end-to-end (including live video and WebRTC data flow) using a throwaway fake host and Playwright, all on macOS, with no Windows or GUI-toolkit dependency at all.
