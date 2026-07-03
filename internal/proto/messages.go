@@ -14,13 +14,15 @@ import (
 type MsgType string
 
 const (
-	MsgRegisterHost   MsgType = "register_host"
-	MsgListSessions   MsgType = "list_sessions"
-	MsgSessionList    MsgType = "session_list"
-	MsgConnectRequest MsgType = "connect_request"
-	MsgOffer          MsgType = "offer"
-	MsgAnswer         MsgType = "answer"
-	MsgICECandidate   MsgType = "ice_candidate"
+	MsgRegisterHost      MsgType = "register_host"
+	MsgListSessions      MsgType = "list_sessions"
+	MsgSessionList       MsgType = "session_list"
+	MsgConnectRequest    MsgType = "connect_request"
+	MsgOffer             MsgType = "offer"
+	MsgAnswer            MsgType = "answer"
+	MsgICECandidate      MsgType = "ice_candidate"
+	MsgRequestScreenshot MsgType = "request_screenshot"
+	MsgScreenshot        MsgType = "screenshot"
 )
 
 type Envelope struct {
@@ -51,6 +53,15 @@ type ICECandidateMessage struct {
 	Candidate string `json:"candidate"`
 	SDPMid    string `json:"sdp_mid"`
 	SDPMLine  uint16 `json:"sdp_mline_index"`
+}
+
+// ScreenshotMessage carries a single one-off preview JPEG from host to
+// viewer over the plain signaling WebSocket — no WebRTC session needed.
+// JPEG is base64-encoded automatically by encoding/json since it's a
+// []byte field; a single low-res preview is small enough that the ~33%
+// base64 overhead doesn't matter the way it would for the video stream.
+type ScreenshotMessage struct {
+	JPEG []byte `json:"jpeg"`
 }
 
 // --- DataChannel messages (host <-> viewer, length-prefixed JSON frames) ---

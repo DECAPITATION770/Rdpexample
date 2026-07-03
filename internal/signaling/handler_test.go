@@ -168,3 +168,68 @@ func TestHandler_RelaysOfferAnswerAndICEBetweenViewerAndHost(t *testing.T) {
 		t.Fatalf("gotHostICEMsg.Candidate = %q, want %q", gotHostICEMsg.Candidate, "cand-from-host")
 	}
 }
+
+func TestHandler_RelaysScreenshotRequestAndResponse(t *testing.T) {
+	reg := NewRegistry()
+	srv := httptest.NewServer(NewHandler(reg))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	hostConn, _, err := websocket.DefaultDialer.Dial(wsURL+"/ws/host", nil)
+	if err != nil {
+		t.Fatalf("dial host: %v", err)
+	}
+	defer hostConn.Close()
+
+	payload, _ := json.Marshal(proto.RegisterHost{Name: "PC-OFFICE-1"})
+	hostConn.WriteJSON(proto.Envelope{Type: proto.MsgRegisterHost, Payload: payload})
+	time.Sleep(50 * time.Millisecond)
+
+	viewerConn, _, err := websocket.DefaultDialer.Dial(wsURL+"/ws/viewer", nil)
+	if err != nil {
+		t.Fatalf("dial viewer: %v", err)
+	}
+	defer viewerConn.Close()
+
+	viewerConn.WriteJSON(proto.Envelope{Type: proto.MsgListSessions})
+	viewerConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var listResp proto.Envelope
+	viewerConn.ReadJSON(&listResp)
+	var list proto.SessionList
+	json.Unmarshal(listResp.Payload, &list)
+	sessionID := list.Sessions[0].SessionID
+
+	// viewer -> host: request a one-off screenshot, no WebRTC involved
+	if err := viewerConn.WriteJSON(proto.Envelope{Type: proto.MsgRequestScreenshot, SessionID: sessionID}); err != nil {
+		t.Fatalf("write screenshot request: %v", err)
+	}
+
+	hostConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var gotRequest proto.Envelope
+	if err := hostConn.ReadJSON(&gotRequest); err != nil {
+		t.Fatalf("host read screenshot request: %v", err)
+	}
+	if gotRequest.Type != proto.MsgRequestScreenshot {
+		t.Fatalf("gotRequest.Type = %v, want request_screenshot", gotRequest.Type)
+	}
+
+	// host -> viewer: the actual JPEG
+	shotPayload, _ := json.Marshal(proto.ScreenshotMessage{JPEG: []byte("fake-jpeg-bytes")})
+	if err := hostConn.WriteJSON(proto.Envelope{Type: proto.MsgScreenshot, SessionID: sessionID, Payload: shotPayload}); err != nil {
+		t.Fatalf("write screenshot: %v", err)
+	}
+
+	viewerConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var gotShot proto.Envelope
+	if err := viewerConn.ReadJSON(&gotShot); err != nil {
+		t.Fatalf("viewer read screenshot: %v", err)
+	}
+	if gotShot.Type != proto.MsgScreenshot {
+		t.Fatalf("gotShot.Type = %v, want screenshot", gotShot.Type)
+	}
+	var gotShotMsg proto.ScreenshotMessage
+	_ = json.Unmarshal(gotShot.Payload, &gotShotMsg)
+	if string(gotShotMsg.JPEG) != "fake-jpeg-bytes" {
+		t.Fatalf("gotShotMsg.JPEG = %q, want %q", gotShotMsg.JPEG, "fake-jpeg-bytes")
+	}
+}

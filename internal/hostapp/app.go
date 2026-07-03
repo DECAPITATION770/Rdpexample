@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"log"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,6 +25,25 @@ import (
 	"rdpAiAnswer/internal/proto"
 	"rdpAiAnswer/internal/webrtcconn"
 )
+
+// safeConn wraps the signaling WebSocket with a write mutex. Multiple
+// goroutines write to it concurrently — handleOffer's answer, per-session
+// screenshot responses — and gorilla/websocket only allows one concurrent
+// writer per connection. Reads happen only on Run's single loop, so
+// ReadJSON needs no locking.
+type safeConn struct {
+	mu   sync.Mutex
+	conn *websocket.Conn
+}
+
+func (c *safeConn) WriteJSON(v any) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteJSON(v)
+}
+
+func (c *safeConn) ReadJSON(v any) error { return c.conn.ReadJSON(v) }
+func (c *safeConn) Close() error         { return c.conn.Close() }
 
 type Config struct {
 	SignalingURL  string        // e.g. ws://your-vps:9000/ws/host
@@ -61,10 +81,11 @@ func (c Config) iceServers() []webrtc.ICEServer {
 func Run(cfg Config) error {
 	cfg.applyDefaults()
 
-	conn, _, err := websocket.DefaultDialer.Dial(cfg.SignalingURL, nil)
+	rawConn, _, err := websocket.DefaultDialer.Dial(cfg.SignalingURL, nil)
 	if err != nil {
 		return err
 	}
+	conn := &safeConn{conn: rawConn}
 	defer conn.Close()
 
 	payload, _ := json.Marshal(proto.RegisterHost{Name: cfg.Name})
@@ -82,12 +103,34 @@ func Run(cfg Config) error {
 		switch env.Type {
 		case proto.MsgOffer:
 			go handleOffer(conn, cfg, env)
+		case proto.MsgRequestScreenshot:
+			go handleScreenshotRequest(conn, env)
 		default:
 			// MsgICECandidate is relayed by the signaling server but
 			// unused here: webrtcconn.Peer waits for full ICE gathering
 			// before returning an offer/answer (non-trickle ICE), so the
 			// SDP already carries every candidate. Nothing else to do.
 		}
+	}
+}
+
+// handleScreenshotRequest answers a one-off preview request from the
+// session list — no WebRTC negotiation, just a single lower-quality
+// JPEG sent straight back over the signaling connection.
+func handleScreenshotRequest(signaling *safeConn, env proto.Envelope) {
+	const previewQuality = 50 // lower than the live video stream's quality; this is just a quick preview
+	jpegBytes, _, _, err := capture.GrabPrimaryJPEG(previewQuality)
+	if err != nil {
+		log.Printf("hostapp: screenshot capture failed: %v", err)
+		return
+	}
+	payload, err := json.Marshal(proto.ScreenshotMessage{JPEG: jpegBytes})
+	if err != nil {
+		log.Printf("hostapp: failed to encode screenshot: %v", err)
+		return
+	}
+	if err := signaling.WriteJSON(proto.Envelope{Type: proto.MsgScreenshot, SessionID: env.SessionID, Payload: payload}); err != nil {
+		log.Printf("hostapp: failed to send screenshot: %v", err)
 	}
 }
 
@@ -103,7 +146,7 @@ type screenBounds struct {
 	height atomic.Int32
 }
 
-func handleOffer(signaling *websocket.Conn, cfg Config, env proto.Envelope) {
+func handleOffer(signaling *safeConn, cfg Config, env proto.Envelope) {
 	var sdpMsg proto.SDPMessage
 	if err := json.Unmarshal(env.Payload, &sdpMsg); err != nil {
 		log.Printf("hostapp: bad offer payload for session %s: %v", env.SessionID, err)

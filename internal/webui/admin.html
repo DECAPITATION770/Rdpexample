@@ -12,13 +12,24 @@
   button.primary { background: #2d6cdf; border-color: #2d6cdf; }
   #session-list-view { padding: 16px; max-width: 480px; margin: 0 auto; }
   #sessions { list-style: none; margin: 12px 0; padding: 0; }
-  #sessions li { padding: 10px 12px; margin-bottom: 6px; background: #262626; border-radius: 6px; cursor: pointer; }
-  #sessions li:hover { background: #2f2f2f; }
-  #sessions li.offline { opacity: 0.5; cursor: default; }
+  #sessions li { padding: 10px 12px; margin-bottom: 6px; background: #262626; border-radius: 6px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  #sessions li .name { cursor: pointer; flex: 1; }
+  #sessions li .name:hover { text-decoration: underline; }
+  #sessions li.offline .name { opacity: 0.5; cursor: default; }
+  #sessions li .shot-btn { font-size: 12px; padding: 4px 8px; }
   #control-view { display: flex; height: calc(100vh - 49px); }
-  #screen-wrap { flex: 1; display: flex; align-items: center; justify-content: center; background: #000; overflow: auto; }
+  #screen-wrap { position: relative; flex: 1; display: flex; align-items: center; justify-content: center; background: #000; overflow: auto; }
   #screen { max-width: 100%; max-height: 100%; cursor: crosshair; }
+  #expand-btn { position: absolute; top: 10px; right: 10px; z-index: 5; font-size: 12px; opacity: 0.8; }
+  #expand-btn:hover { opacity: 1; }
   #sidebar { width: 260px; padding: 16px; background: #262626; border-left: 1px solid #333; display: flex; flex-direction: column; gap: 16px; }
+  /* Expanded mode: the video fills the whole control-view; the sidebar
+     becomes a floating translucent overlay instead of a dedicated flex
+     column, so the toggles/message form stay reachable without a real
+     Fullscreen API hiding them entirely. */
+  #control-view.expanded #sidebar { position: fixed; top: 49px; right: 0; bottom: 0; width: 240px; background: rgba(38, 38, 38, 0.88); backdrop-filter: blur(4px); z-index: 10; overflow-y: auto; }
+  #screenshot-modal { position: fixed; inset: 0; top: 49px; background: rgba(0, 0, 0, 0.92); z-index: 20; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; }
+  #screenshot-modal img { max-width: 92vw; max-height: 82vh; border-radius: 4px; }
   .toggle-row { display: flex; flex-direction: column; gap: 4px; padding: 10px; background: #1e1e1e; border-radius: 6px; }
   .toggle-row .top { display: flex; justify-content: space-between; align-items: center; }
   .hotkey-label { font-size: 12px; color: #999; }
@@ -41,8 +52,14 @@
   <ul id="sessions"></ul>
 </div>
 
+<div id="screenshot-modal" hidden>
+  <img id="screenshot-img" alt="screenshot">
+  <button id="screenshot-close">Close</button>
+</div>
+
 <div id="control-view" hidden>
   <div id="screen-wrap">
+    <button id="expand-btn">⛶ Expand</button>
     <canvas id="screen" width="800" height="600" tabindex="0"></canvas>
   </div>
   <div id="sidebar">
@@ -162,17 +179,19 @@ const MODIFIER_CODES = new Set(["ControlLeft", "ControlRight", "AltLeft", "AltRi
 // ---------- SignalingClient: one WebSocket to the server's /ws/viewer ----------
 
 class SignalingClient {
-  constructor(onSessionList, onAnswer) {
+  constructor(onSessionList, onAnswer, onScreenshot) {
     const base = location.origin.replace(/^http/, "ws");
     this.ws = new WebSocket(base + "/ws/viewer");
     this.onSessionList = onSessionList;
     this.onAnswer = onAnswer;
+    this.onScreenshot = onScreenshot;
     this.ws.onmessage = (ev) => this._handle(JSON.parse(ev.data));
   }
 
   _handle(env) {
     if (env.type === "session_list") this.onSessionList(env.payload.sessions || []);
     else if (env.type === "answer") this.onAnswer(env.payload.sdp);
+    else if (env.type === "screenshot") this.onScreenshot(env.payload.jpeg);
     // ice_candidate is unused: both sides wait for full ICE gathering
     // before exchanging SDP (non-trickle), so candidates already ride
     // along inside the offer/answer SDP itself.
@@ -184,6 +203,13 @@ class SignalingClient {
 
   sendOffer(sessionId, sdp) {
     this.ws.send(JSON.stringify({ type: "offer", session_id: sessionId, payload: { sdp } }));
+  }
+
+  // requestScreenshot asks the host for a single one-off preview JPEG —
+  // no WebRTC session involved, just this WebSocket. Fine for a quick
+  // "what's on that screen right now" peek from the session list.
+  requestScreenshot(sessionId) {
+    this.ws.send(JSON.stringify({ type: "request_screenshot", session_id: sessionId }));
   }
 }
 
@@ -306,6 +332,10 @@ const els = {
   msgText: document.getElementById("msg-text"),
   msgFade: document.getElementById("msg-fade"),
   msgSend: document.getElementById("msg-send"),
+  expandBtn: document.getElementById("expand-btn"),
+  screenshotModal: document.getElementById("screenshot-modal"),
+  screenshotImg: document.getElementById("screenshot-img"),
+  screenshotClose: document.getElementById("screenshot-close"),
 };
 
 let sessions = [];
@@ -322,19 +352,52 @@ updateHotkeyLabels();
 
 const signaling = new SignalingClient(
   (list) => { sessions = list; renderSessions(); },
-  (sdp) => { if (remote) remote.acceptAnswer(sdp); }
+  (sdp) => { if (remote) remote.acceptAnswer(sdp); },
+  (jpegBase64) => showScreenshotModal(jpegBase64)
 );
 
 function renderSessions() {
   els.sessions.innerHTML = "";
   for (const s of sessions) {
     const li = document.createElement("li");
-    li.textContent = (s.online ? "\u{1F7E2} " : "⚪ ") + s.name;
     if (!s.online) li.classList.add("offline");
-    else li.addEventListener("click", () => openSession(s));
+
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = (s.online ? "\u{1F7E2} " : "⚪ ") + s.name;
+    if (s.online) name.addEventListener("click", () => openSession(s));
+    li.appendChild(name);
+
+    if (s.online) {
+      const shotBtn = document.createElement("button");
+      shotBtn.className = "shot-btn";
+      shotBtn.textContent = "Screenshot";
+      shotBtn.addEventListener("click", () => signaling.requestScreenshot(s.session_id));
+      li.appendChild(shotBtn);
+    }
+
     els.sessions.appendChild(li);
   }
 }
+
+// showScreenshotModal displays a one-off preview JPEG (from
+// requestScreenshot, no WebRTC involved) large within the page — not via
+// the real Fullscreen API, so the close button and rest of the page
+// chrome stay reachable.
+function showScreenshotModal(jpegBase64) {
+  els.screenshotImg.src = "data:image/jpeg;base64," + jpegBase64;
+  els.screenshotModal.hidden = false;
+}
+els.screenshotClose.addEventListener("click", () => { els.screenshotModal.hidden = true; });
+
+// Expand toggles the live control-window video to fill the available
+// space; the sidebar (toggles + message form) becomes a floating
+// translucent overlay instead of disappearing, unlike the browser's
+// real Fullscreen API which would hide it entirely.
+els.expandBtn.addEventListener("click", () => {
+  const expanded = els.controlView.classList.toggle("expanded");
+  els.expandBtn.textContent = expanded ? "⛶ Collapse" : "⛶ Expand";
+});
 
 els.refresh.addEventListener("click", () => signaling.requestSessionList());
 signaling.ws.addEventListener("open", () => signaling.requestSessionList());
@@ -357,6 +420,8 @@ els.back.addEventListener("click", () => {
   els.back.hidden = true;
   els.listView.hidden = false;
   els.controlView.hidden = true;
+  els.controlView.classList.remove("expanded");
+  els.expandBtn.textContent = "⛶ Expand";
   els.headerTitle.textContent = "RDP-Tool — Sessions";
 });
 
