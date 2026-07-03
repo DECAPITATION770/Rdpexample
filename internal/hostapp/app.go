@@ -25,11 +25,13 @@ import (
 )
 
 type Config struct {
-	SignalingURL string        // e.g. ws://your-vps:9000/ws/host
-	Name         string        // display name shown in the viewer's session list
-	ICEServers   []string      // STUN/TURN URLs, e.g. "stun:vps:3478"; empty is fine on a LAN/loopback
-	JPEGQuality  int           // 1-100; 0 defaults to 70
-	FrameDelay   time.Duration // 0 defaults to 100ms (~10fps)
+	SignalingURL  string        // e.g. ws://your-vps:9000/ws/host
+	Name          string        // display name shown in the viewer's session list
+	ICEServers    []string      // STUN/TURN URLs, e.g. "stun:vps:3478"; empty is fine on a LAN/loopback
+	ICEUsername   string        // TURN username; ignored by STUN entries
+	ICECredential string        // TURN credential; ignored by STUN entries
+	JPEGQuality   int           // 1-100; 0 defaults to 70
+	FrameDelay    time.Duration // 0 defaults to 100ms (~10fps)
 }
 
 func (c *Config) applyDefaults() {
@@ -45,7 +47,7 @@ func (c Config) iceServers() []webrtc.ICEServer {
 	if len(c.ICEServers) == 0 {
 		return nil
 	}
-	return []webrtc.ICEServer{{URLs: c.ICEServers}}
+	return []webrtc.ICEServer{{URLs: c.ICEServers, Username: c.ICEUsername, Credential: c.ICECredential}}
 }
 
 // Run connects to the signaling server, registers as a host, and for

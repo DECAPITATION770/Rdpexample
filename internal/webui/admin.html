@@ -144,14 +144,27 @@ class SignalingClient {
   }
 }
 
+// ---------- ICE server config, fetched once from the server ----------
+
+let iceServersPromise = null;
+function fetchIceServers() {
+  if (!iceServersPromise) {
+    iceServersPromise = fetch("/config")
+      .then((r) => r.json())
+      .then((cfg) => cfg.iceServers || [])
+      .catch((e) => { console.error("failed to fetch /config:", e); return []; });
+  }
+  return iceServersPromise;
+}
+
 // ---------- RemoteSession: one WebRTC PeerConnection to a host ----------
 
 class RemoteSession {
-  constructor(signaling, session, onFrame) {
+  constructor(signaling, session, onFrame, iceServers) {
     this.signaling = signaling;
     this.session = session;
     this.onFrame = onFrame;
-    this.pc = new RTCPeerConnection({ iceServers: [] });
+    this.pc = new RTCPeerConnection({ iceServers: iceServers || [] });
     this.dc = this.pc.createDataChannel("control");
     this.dc.binaryType = "arraybuffer";
     this.dc.onmessage = (ev) => this.onFrame(decodeFrame(ev.data));
@@ -264,7 +277,7 @@ function renderSessions() {
 els.refresh.addEventListener("click", () => signaling.requestSessionList());
 signaling.ws.addEventListener("open", () => signaling.requestSessionList());
 
-function openSession(session) {
+async function openSession(session) {
   els.headerTitle.textContent = session.name;
   els.back.hidden = false;
   els.listView.hidden = true;
@@ -272,9 +285,10 @@ function openSession(session) {
   els.mouseToggle.checked = false;
   els.kbToggle.checked = false;
 
+  const iceServers = await fetchIceServers();
   remote = new RemoteSession(signaling, session, ({ kind, obj }) => {
     if (kind === FRAME_SCREEN_FRAME) renderScreenFrame(obj);
-  });
+  }, iceServers);
   remote.connect();
 }
 
