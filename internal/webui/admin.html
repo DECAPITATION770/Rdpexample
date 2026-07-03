@@ -30,8 +30,15 @@
   /* Expanded mode: the video fills the whole control-view; the sidebar
      becomes a floating translucent overlay instead of a dedicated flex
      column, so the toggles/message form stay reachable without a real
-     Fullscreen API hiding them entirely. */
-  #control-view.expanded #sidebar { position: fixed; top: 49px; right: 0; bottom: 0; width: 240px; background: rgba(38, 38, 38, 0.88); backdrop-filter: blur(4px); z-index: 10; overflow-y: auto; }
+     Fullscreen API hiding them entirely. It stays off-screen (slid past
+     the right edge) until hovered — either directly, or via the thin
+     invisible strip along the edge that catches the mouse before it
+     reaches the sidebar itself — so the video isn't permanently
+     obstructed while expanded. */
+  #control-view.expanded #sidebar { position: fixed; top: 49px; right: 0; bottom: 0; width: 240px; background: rgba(38, 38, 38, 0.88); backdrop-filter: blur(4px); z-index: 10; overflow-y: auto; transform: translateX(100%); transition: transform 0.18s ease; }
+  #control-view.expanded #sidebar.revealed { transform: translateX(0); }
+  #sidebar-hover-zone { display: none; }
+  #control-view.expanded #sidebar-hover-zone { display: block; position: fixed; top: 49px; right: 0; bottom: 0; width: 14px; z-index: 9; }
   #screenshot-modal { position: fixed; inset: 0; top: 49px; background: rgba(0, 0, 0, 0.92); z-index: 20; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; }
   #screenshot-modal img { max-width: 92vw; max-height: 82vh; border-radius: 4px; }
   .toggle-row { display: flex; flex-direction: column; gap: 4px; padding: 10px; background: #1e1e1e; border-radius: 6px; }
@@ -73,6 +80,7 @@
     <canvas id="screen" width="800" height="600" tabindex="0"></canvas>
     <img id="screen-http" hidden alt="live view (HTTP)">
   </div>
+  <div id="sidebar-hover-zone"></div>
   <div id="sidebar">
     <div class="toggle-row">
       <div class="top">
@@ -360,6 +368,8 @@ const els = {
   msgFade: document.getElementById("msg-fade"),
   msgSend: document.getElementById("msg-send"),
   expandBtn: document.getElementById("expand-btn"),
+  sidebar: document.getElementById("sidebar"),
+  sidebarHoverZone: document.getElementById("sidebar-hover-zone"),
   shotBtn: document.getElementById("shot-btn"),
   statusBadge: document.getElementById("status-badge"),
   screenshotModal: document.getElementById("screenshot-modal"),
@@ -462,7 +472,28 @@ els.screenshotClose.addEventListener("click", () => { els.screenshotModal.hidden
 els.expandBtn.addEventListener("click", () => {
   const expanded = els.controlView.classList.toggle("expanded");
   els.expandBtn.textContent = expanded ? "⛶ Collapse" : "⛶ Expand";
+  els.sidebar.classList.remove("revealed"); // start hidden either way; hover reveals it
 });
+
+// In expanded mode the sidebar auto-hides until the mouse is near the
+// right edge: the hover zone is a thin strip that catches the pointer
+// before it reaches the sidebar itself (so there's no dead gap the
+// mouse has to cross), and the sidebar re-hides shortly after the mouse
+// leaves both the zone and the sidebar (a short delay so moving from
+// the zone into the sidebar doesn't cause a flicker).
+let sidebarHideTimeout = null;
+function revealSidebar() {
+  clearTimeout(sidebarHideTimeout);
+  els.sidebar.classList.add("revealed");
+}
+function scheduleHideSidebar() {
+  clearTimeout(sidebarHideTimeout);
+  sidebarHideTimeout = setTimeout(() => els.sidebar.classList.remove("revealed"), 400);
+}
+els.sidebarHoverZone.addEventListener("mouseenter", revealSidebar);
+els.sidebarHoverZone.addEventListener("mouseleave", scheduleHideSidebar);
+els.sidebar.addEventListener("mouseenter", revealSidebar);
+els.sidebar.addEventListener("mouseleave", scheduleHideSidebar);
 
 els.refresh.addEventListener("click", () => signaling.requestSessionList());
 signaling.ws.addEventListener("open", () => signaling.requestSessionList());
@@ -553,6 +584,8 @@ els.back.addEventListener("click", () => {
   els.listView.hidden = false;
   els.controlView.hidden = true;
   els.controlView.classList.remove("expanded");
+  els.sidebar.classList.remove("revealed");
+  clearTimeout(sidebarHideTimeout);
   els.expandBtn.textContent = "⛶ Expand";
   els.headerTitle.textContent = "RDP-Tool — Sessions";
 });
