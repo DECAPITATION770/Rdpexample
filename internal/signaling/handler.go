@@ -67,6 +67,7 @@ func NewHandler(reg *Registry) *Handler {
 	}
 	h.mux.HandleFunc("/ws/host", h.handleHost)
 	h.mux.HandleFunc("/ws/viewer", h.handleViewer)
+	h.mux.HandleFunc("GET /stream/{session_id}", h.handleStream)
 	return h
 }
 

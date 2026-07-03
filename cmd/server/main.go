@@ -37,6 +37,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/ws/", sigHandler)
+	mux.Handle("/stream/", sigHandler)
 	mux.HandleFunc("/config", webui.ConfigHandler(urls, *turnUsername, *turnCredential))
 	mux.Handle("/", webui.Handler())
 
