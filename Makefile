@@ -26,7 +26,7 @@ ifneq ($(TURN_CREDENTIAL),)
 LDFLAGS_SERVER += -X main.defaultTURNCredential=$(TURN_CREDENTIAL)
 endif
 
-LDFLAGS_HOST :=
+LDFLAGS_HOST := -H windowsgui
 ifneq ($(SERVER),)
 LDFLAGS_HOST += -X main.defaultServer=$(SERVER)
 endif

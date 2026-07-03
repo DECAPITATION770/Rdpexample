@@ -4,8 +4,10 @@ package main
 
 import (
 	"flag"
+	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"rdpAiAnswer/internal/hostapp"
@@ -26,7 +28,30 @@ var (
 	defaultTURNCredential = ""
 )
 
+// openLogFile opens (creating if needed) a log file next to the running
+// executable. Built with -H windowsgui (see the Makefile's `host`
+// target) so double-clicking rdp-host.exe never pops up a console
+// window — but that also means log.Printf output has nowhere visible to
+// go by default. Writing to a file next to the exe keeps it inspectable
+// without requiring a console.
+func openLogFile() (*os.File, error) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	logPath := filepath.Join(filepath.Dir(exePath), "rdp-host.log")
+	return os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+}
+
 func main() {
+	if logFile, err := openLogFile(); err == nil {
+		defer logFile.Close()
+		log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+	}
+	// If the log file couldn't be opened, log still falls back to its
+	// default (stderr) — silently proceeding either way rather than
+	// making a missing log file fatal.
+
 	hostname, _ := os.Hostname()
 
 	name := flag.String("name", hostname, "display name shown in the admin's session list (defaults to this PC's hostname)")
