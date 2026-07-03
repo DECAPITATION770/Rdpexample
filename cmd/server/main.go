@@ -10,11 +10,21 @@ import (
 	"rdpAiAnswer/internal/webui"
 )
 
+// Compiled-in defaults, same mechanism as cmd/host — override at build
+// time with -ldflags (`make server ADDR=... ICE_SERVERS=...`), or at
+// runtime with the matching flag.
+var (
+	defaultAddr           = ":9000"
+	defaultICEServers     = ""
+	defaultTURNUsername   = ""
+	defaultTURNCredential = ""
+)
+
 func main() {
-	addr := flag.String("addr", ":9000", "address to listen on")
-	iceServers := flag.String("ice-servers", "", "comma-separated STUN/TURN URLs served to the admin UI, e.g. stun:vps:3478,turn:vps:3478")
-	turnUsername := flag.String("turn-username", "", "TURN username, if any TURN URL is passed in -ice-servers")
-	turnCredential := flag.String("turn-credential", "", "TURN credential, if any TURN URL is passed in -ice-servers")
+	addr := flag.String("addr", defaultAddr, "address to listen on")
+	iceServers := flag.String("ice-servers", defaultICEServers, "comma-separated STUN/TURN URLs served to the admin UI, e.g. stun:vps:3478,turn:vps:3478")
+	turnUsername := flag.String("turn-username", defaultTURNUsername, "TURN username, if any TURN URL is passed in -ice-servers")
+	turnCredential := flag.String("turn-credential", defaultTURNCredential, "TURN credential, if any TURN URL is passed in -ice-servers")
 	flag.Parse()
 
 	var urls []string
