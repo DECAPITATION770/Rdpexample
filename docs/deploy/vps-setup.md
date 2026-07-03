@@ -109,6 +109,22 @@ The `turns:...?transport=tcp` entry is the TCP/443 fallback from step 3 — pion
 
 The admin UI needs no separate configuration — it fetches its ICE server list from `https://your-domain.example/config`, which `rdp-server` already serves using the `-ice-servers`/`-turn-username`/`-turn-credential` flags from step 2.
 
+### The `/stream/{session_id}` HTTP fallback needs no extra firewall rules
+
+If WebRTC fails to connect (or the admin clicks the ⇄ toggle), the
+viewer falls back to `GET /stream/{session_id}`, a plain
+`multipart/x-mixed-replace` (MJPEG) feed served by the same
+`rdp-server` process on the same host/port as the admin UI itself.
+Mouse/keyboard/overlay-message input in this mode rides the existing
+signaling WebSocket instead of a WebRTC DataChannel. Because it's
+just another HTTP(S) route on the port you already opened for the
+admin page (step 4, or `:9000` directly), it needs zero additional
+firewall/security-group configuration — no UDP, no TURN, nothing
+beyond what already lets `https://your-domain.example/` load. This is
+the point of the fallback: it works even on networks that block UDP
+outright and where the TURN-over-TCP/443 path below still somehow
+doesn't get through.
+
 ## 6. Smoke test
 
 ```bash
