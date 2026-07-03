@@ -1326,6 +1326,9 @@ const (
 	mouseEventAbsolute = 0x8000
 
 	keyEventKeyUp = 0x0002
+
+	smCXScreen = 0
+	smCYScreen = 1
 )
 
 type mouseInput struct {
@@ -1344,16 +1347,22 @@ type keybdInput struct {
 	dwExtraInfo uintptr
 }
 
+// input mirrors Win32's INPUT union. Go's struct alignment already
+// inserts the same 4 bytes of padding before mi that the real C union
+// gets (mi's largest field, dwExtraInfo uintptr, forces 8-byte
+// alignment), so `input{}` is exactly 40 bytes on amd64 — the same as
+// sizeof(INPUT). Do NOT add a manual trailing padding field: SendInput
+// validates its cbSize argument against the real struct size and returns
+// 0 (fails silently) if it doesn't match exactly.
 type input struct {
 	inputType uint32
-	// union of mouseInput/keybdInput, padded to the larger member's size
-	mi mouseInput
-	_  [8]byte // padding so the struct is layout-compatible across mi/ki use
+	mi        mouseInput // union slot; KeyPress reinterprets this memory as keybdInput
 }
 
 var (
-	user32       = windows.NewLazySystemDLL("user32.dll")
-	procSendInput = user32.NewProc("SendInput")
+	user32               = windows.NewLazySystemDLL("user32.dll")
+	procSendInput        = user32.NewProc("SendInput")
+	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
 )
 
 func sendRawInput(in input) error {
@@ -1365,9 +1374,30 @@ func sendRawInput(in input) error {
 	return nil
 }
 
+func getSystemMetrics(index int) int32 {
+	ret, _, _ := procGetSystemMetrics.Call(uintptr(index))
+	return int32(ret)
+}
+
+// MoveMouse moves the cursor to absolute screen pixel coordinates,
+// matching the coordinate space internal/capture captures from.
+// MOUSEEVENTF_ABSOLUTE requires coordinates normalized to 0..65535, NOT
+// raw pixels — passing raw pixel values silently places the cursor
+// wildly off-target on any screen smaller than 65535px. This normalizes
+// against the primary display's resolution (SM_CXSCREEN/SM_CYSCREEN)
+// before calling SendInput.
 func MoveMouse(x, y int32) error {
+	screenW := getSystemMetrics(smCXScreen)
+	screenH := getSystemMetrics(smCYScreen)
+	if screenW <= 1 || screenH <= 1 {
+		screenW, screenH = 1920, 1080 // defensive fallback; should not happen on a real display
+	}
+
+	normX := int32((int64(x) * 65535) / int64(screenW-1))
+	normY := int32((int64(y) * 65535) / int64(screenH-1))
+
 	in := input{inputType: inputMouse, mi: mouseInput{
-		dx: x, dy: y,
+		dx: normX, dy: normY,
 		dwFlags: mouseEventMove | mouseEventAbsolute,
 	}}
 	return sendRawInput(in)
@@ -1395,7 +1425,7 @@ func KeyPress(vk uint16, down bool) error {
 }
 ```
 
-*Note for the implementing engineer:* Go doesn't have real unions, so the struct above uses the `unsafe.Pointer` reinterpret trick to reuse the `mi` field's memory for keyboard input. If this feels fragile (it is, slightly), the safer alternative is two separate `SendInput` wrapper functions each building their own correctly-sized byte buffer with `binary.Write` — do that instead if the unsafe cast causes any observed corruption during manual testing.
+*Note for the implementing engineer:* Go doesn't have real unions, so the struct above uses the `unsafe.Pointer` reinterpret trick to reuse the `mi` field's memory for keyboard input. This has been verified with `unsafe.Sizeof`/`unsafe.Offsetof` checks (compiled for a plain 64-bit target, not just windows) to match the real Win32 `INPUT`/`MOUSEINPUT`/`KEYBDINPUT` sizes exactly (40/32/24 bytes on amd64, union starting at offset 8) — if you change these struct definitions, re-run that size check before trusting `SendInput` to accept the result.
 
 **Step 2: Manual verification (on Windows)**
 
