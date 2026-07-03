@@ -71,16 +71,41 @@ func (c Config) iceServers() []webrtc.ICEServer {
 	return []webrtc.ICEServer{{URLs: c.ICEServers, Username: c.ICEUsername, Credential: c.ICECredential}}
 }
 
+// reconnectDelay is how long Run waits before retrying after the
+// signaling connection fails to establish or drops. A single machine
+// running this unattended shouldn't ever need a human to notice a
+// transient network hiccup and manually relaunch it.
+const reconnectDelay = 5 * time.Second
+
 // Run connects to the signaling server, registers as a host, and for
 // every viewer offer it receives, negotiates a WebRTC PeerConnection and
 // streams the primary display to it while applying incoming input and
-// overlay messages. It blocks until the signaling connection drops or
-// fails; callers that want graceful shutdown should run it in a
-// goroutine and close the process via other means (Ctrl+C is enough for
-// the MVP — there is no in-band shutdown message).
+// overlay messages. Unlike a one-shot dial, Run never gives up: if the
+// initial connection fails (server briefly unreachable, DNS not ready
+// yet, transient network blip) or an established connection drops, it
+// logs the error and retries after reconnectDelay, forever — a caller
+// like cmd/host's main() that treats a returned error as fatal would
+// otherwise kill the whole host process on the very first hiccup,
+// requiring a human to notice and relaunch it. Ctrl+C (or killing the
+// process) is still the only way to stop it — there is no in-band
+// shutdown message.
 func Run(cfg Config) error {
 	cfg.applyDefaults()
 
+	bounds := &screenBounds{}
+
+	for {
+		if err := connectAndServe(cfg, bounds); err != nil {
+			log.Printf("hostapp: connection error: %v — reconnecting in %s", err, reconnectDelay)
+		}
+		time.Sleep(reconnectDelay)
+	}
+}
+
+// connectAndServe dials the signaling server once, registers as a host,
+// and serves incoming messages until the connection fails or drops. Its
+// error return is what tells Run's retry loop to try again.
+func connectAndServe(cfg Config, bounds *screenBounds) error {
 	rawConn, _, err := websocket.DefaultDialer.Dial(cfg.SignalingURL, nil)
 	if err != nil {
 		return err
@@ -93,8 +118,6 @@ func Run(cfg Config) error {
 		return err
 	}
 	log.Printf("hostapp: registered as %q, waiting for viewers", cfg.Name)
-
-	bounds := &screenBounds{}
 
 	for {
 		var env proto.Envelope
