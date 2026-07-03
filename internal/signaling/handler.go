@@ -48,11 +48,13 @@ func (c *safeConn) Close() error         { return c.conn.Close() }
 // one active viewer per session is tracked at a time, matching the
 // MVP's one-admin-at-a-time design.
 type Handler struct {
-	mu      sync.Mutex
-	reg     *Registry
-	mux     *http.ServeMux
-	hosts   map[string]*safeConn // sessionID -> host socket
-	viewers map[string]*safeConn // sessionID -> viewer socket
+	mu       sync.Mutex
+	reg      *Registry
+	mux      *http.ServeMux
+	hosts    map[string]*safeConn // sessionID -> host socket
+	viewers  map[string]*safeConn // sessionID -> viewer socket
+	relaysMu sync.Mutex
+	relays   map[string]*FrameBroadcaster // sessionID -> broadcaster
 }
 
 func NewHandler(reg *Registry) *Handler {
@@ -61,10 +63,26 @@ func NewHandler(reg *Registry) *Handler {
 		mux:     http.NewServeMux(),
 		hosts:   make(map[string]*safeConn),
 		viewers: make(map[string]*safeConn),
+		relays:  make(map[string]*FrameBroadcaster),
 	}
 	h.mux.HandleFunc("/ws/host", h.handleHost)
 	h.mux.HandleFunc("/ws/viewer", h.handleViewer)
 	return h
+}
+
+// broadcaster returns the session's FrameBroadcaster, creating it on
+// first use. One broadcaster per session lives for the process lifetime
+// of that session's registration — cheap enough (a map and a mutex) not
+// to bother tearing down on host disconnect.
+func (h *Handler) broadcaster(sessionID string) *FrameBroadcaster {
+	h.relaysMu.Lock()
+	defer h.relaysMu.Unlock()
+	b, ok := h.relays[sessionID]
+	if !ok {
+		b = NewFrameBroadcaster()
+		h.relays[sessionID] = b
+	}
+	return b
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -137,6 +155,12 @@ func (h *Handler) handleHost(w http.ResponseWriter, r *http.Request) {
 			} else {
 				log.Printf("signaling: host %s sent %s but no viewer is attached to this session", sessionID, env.Type)
 			}
+		case proto.MsgRelayFrame:
+			var frame proto.RelayFrameMessage
+			if err := json.Unmarshal(env.Payload, &frame); err != nil {
+				continue
+			}
+			h.broadcaster(sessionID).Publish(frame.JPEG)
 		}
 	}
 }
