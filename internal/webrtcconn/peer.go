@@ -170,6 +170,18 @@ func (p *Peer) SendVideo(data []byte) error {
 	return p.dcVideo.Send(data)
 }
 
+// VideoBufferedAmount reports how many bytes are queued but not yet
+// acknowledged on the video DataChannel. Callers use this to decide
+// whether to skip sending the next frame rather than let pion's send
+// queue grow unbounded when the remote side (or the underlying network
+// path) can't keep up.
+func (p *Peer) VideoBufferedAmount() uint64 {
+	if p.dcVideo == nil {
+		return 0
+	}
+	return p.dcVideo.BufferedAmount()
+}
+
 func (p *Peer) Close() error {
 	return p.pc.Close()
 }

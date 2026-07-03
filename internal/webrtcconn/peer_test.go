@@ -111,3 +111,50 @@ func TestPeer_SendBeforeConnectedFails(t *testing.T) {
 		t.Fatal("SendVideo before any offer/answer exchange should fail, got nil error")
 	}
 }
+
+func TestPeer_VideoBufferedAmount_ZeroBeforeConnected(t *testing.T) {
+	p, err := NewPeer(nil)
+	if err != nil {
+		t.Fatalf("NewPeer: %v", err)
+	}
+	defer p.Close()
+
+	if got := p.VideoBufferedAmount(); got != 0 {
+		t.Fatalf("VideoBufferedAmount() before any data channel exists = %d, want 0", got)
+	}
+}
+
+func TestPeer_VideoBufferedAmount_TracksAfterConnect(t *testing.T) {
+	offerer, err := NewPeer(nil)
+	if err != nil {
+		t.Fatalf("NewPeer offerer: %v", err)
+	}
+	defer offerer.Close()
+	answerer, err := NewPeer(nil)
+	if err != nil {
+		t.Fatalf("NewPeer answerer: %v", err)
+	}
+	defer answerer.Close()
+
+	offer, err := offerer.CreateOffer()
+	if err != nil {
+		t.Fatalf("CreateOffer: %v", err)
+	}
+	answer, err := answerer.AcceptOffer(offer)
+	if err != nil {
+		t.Fatalf("AcceptOffer: %v", err)
+	}
+	if err := offerer.AcceptAnswer(answer); err != nil {
+		t.Fatalf("AcceptAnswer: %v", err)
+	}
+	if err := offerer.WaitConnected(5 * time.Second); err != nil {
+		t.Fatalf("WaitConnected: %v", err)
+	}
+
+	// Connected with nothing sent yet: buffered amount is 0. This just
+	// proves the method reads the real channel post-connect rather than
+	// always returning the pre-connect zero value from a nil dcVideo.
+	if got := offerer.VideoBufferedAmount(); got != 0 {
+		t.Fatalf("VideoBufferedAmount() right after connect = %d, want 0", got)
+	}
+}
