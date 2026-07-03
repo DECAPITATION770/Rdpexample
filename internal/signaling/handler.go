@@ -162,7 +162,7 @@ func (h *Handler) handleViewer(w http.ResponseWriter, r *http.Request) {
 			payload, _ := json.Marshal(list)
 			_ = conn.WriteJSON(proto.Envelope{Type: proto.MsgSessionList, Payload: payload})
 			log.Printf("signaling: sent session list (%d sessions) to viewer %s", len(list.Sessions), r.RemoteAddr)
-		case proto.MsgOffer, proto.MsgICECandidate, proto.MsgRequestScreenshot:
+		case proto.MsgOffer, proto.MsgICECandidate, proto.MsgRequestScreenshot, proto.MsgInputEvent, proto.MsgOverlayMessage:
 			h.setViewer(env.SessionID, conn)
 			if host := h.hostConn(env.SessionID); host != nil {
 				_ = host.WriteJSON(env)

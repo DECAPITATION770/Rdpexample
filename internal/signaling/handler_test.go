@@ -233,3 +233,53 @@ func TestHandler_RelaysScreenshotRequestAndResponse(t *testing.T) {
 		t.Fatalf("gotShotMsg.JPEG = %q, want %q", gotShotMsg.JPEG, "fake-jpeg-bytes")
 	}
 }
+
+func TestHandler_RelaysInputEventFromViewerToHost(t *testing.T) {
+	reg := NewRegistry()
+	srv := httptest.NewServer(NewHandler(reg))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	hostConn, _, err := websocket.DefaultDialer.Dial(wsURL+"/ws/host", nil)
+	if err != nil {
+		t.Fatalf("dial host: %v", err)
+	}
+	defer hostConn.Close()
+
+	payload, _ := json.Marshal(proto.RegisterHost{Name: "PC-1"})
+	hostConn.WriteJSON(proto.Envelope{Type: proto.MsgRegisterHost, Payload: payload})
+	time.Sleep(50 * time.Millisecond)
+
+	viewerConn, _, err := websocket.DefaultDialer.Dial(wsURL+"/ws/viewer", nil)
+	if err != nil {
+		t.Fatalf("dial viewer: %v", err)
+	}
+	defer viewerConn.Close()
+
+	viewerConn.WriteJSON(proto.Envelope{Type: proto.MsgListSessions})
+	viewerConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var listResp proto.Envelope
+	viewerConn.ReadJSON(&listResp)
+	var list proto.SessionList
+	json.Unmarshal(listResp.Payload, &list)
+	sessionID := list.Sessions[0].SessionID
+
+	evtPayload, _ := json.Marshal(proto.InputEvent{Kind: proto.InputMouseMove, X: 42, Y: 7})
+	if err := viewerConn.WriteJSON(proto.Envelope{Type: proto.MsgInputEvent, SessionID: sessionID, Payload: evtPayload}); err != nil {
+		t.Fatalf("write input event: %v", err)
+	}
+
+	hostConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var got proto.Envelope
+	if err := hostConn.ReadJSON(&got); err != nil {
+		t.Fatalf("host read input event: %v", err)
+	}
+	if got.Type != proto.MsgInputEvent {
+		t.Fatalf("got.Type = %v, want input_event", got.Type)
+	}
+	var gotEvt proto.InputEvent
+	json.Unmarshal(got.Payload, &gotEvt)
+	if gotEvt.X != 42 || gotEvt.Y != 7 {
+		t.Fatalf("gotEvt = %+v, want X=42 Y=7", gotEvt)
+	}
+}

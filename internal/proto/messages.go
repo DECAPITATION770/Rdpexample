@@ -23,6 +23,8 @@ const (
 	MsgICECandidate      MsgType = "ice_candidate"
 	MsgRequestScreenshot MsgType = "request_screenshot"
 	MsgScreenshot        MsgType = "screenshot"
+	MsgInputEvent        MsgType = "input_event"    // viewer -> host, relayed: proto.InputEvent payload
+	MsgOverlayMessage    MsgType = "overlay_message" // viewer -> host, relayed: proto.OverlayMessage payload
 )
 
 type Envelope struct {
