@@ -1,11 +1,11 @@
-//go:build windows
+//go:build windows || linux
 
-// Package hostapp wires together the Windows-only pieces (screen capture,
-// input injection, overlay messages) with the signaling connection and a
-// WebRTC PeerConnection per viewer. It only builds for windows since it
-// depends on internal/capture, internal/input, and internal/overlay,
-// which are all windows-only — matching cmd/host, the only thing that
-// imports this package.
+// Package hostapp wires together the platform-native pieces (screen
+// capture, input injection, overlay messages) with the signaling
+// connection and a WebRTC PeerConnection per viewer. It builds for
+// windows and linux since it depends on internal/capture, internal/input,
+// and internal/overlay, each of which has an implementation for both —
+// matching cmd/host, the only thing that imports this package.
 package hostapp
 
 import (
