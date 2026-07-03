@@ -3,6 +3,7 @@
 package input
 
 import (
+	"errors"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -26,9 +27,6 @@ const (
 	mouseEventAbsolute = 0x8000
 
 	keyEventKeyUp = 0x0002
-
-	smCXScreen = 0
-	smCYScreen = 1
 )
 
 type mouseInput struct {
@@ -53,9 +51,8 @@ type input struct {
 }
 
 var (
-	user32               = windows.NewLazySystemDLL("user32.dll")
-	procSendInput        = user32.NewProc("SendInput")
-	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
+	user32        = windows.NewLazySystemDLL("user32.dll")
+	procSendInput = user32.NewProc("SendInput")
 )
 
 func sendRawInput(in input) error {
@@ -67,22 +64,20 @@ func sendRawInput(in input) error {
 	return nil
 }
 
-func getSystemMetrics(index int) int32 {
-	ret, _, _ := procGetSystemMetrics.Call(uintptr(index))
-	return int32(ret)
-}
-
 // MoveMouse moves the cursor to absolute screen pixel coordinates (x, y),
-// as measured against the primary display — the same coordinate space
-// internal/capture's GrabPrimaryJPEG captures from. Win32's
+// given the width/height of the screen those coordinates were computed
+// against. Callers MUST pass the exact dimensions internal/capture
+// actually captured (not a separate GetSystemMetrics query) — on a
+// display with Windows DPI scaling active, GetSystemMetrics can report a
+// different (logical) resolution than what GDI captures (physical
+// pixels), which throws off absolute positioning in a way that looks
+// like the cursor just doesn't land where you clicked. Win32's
 // MOUSEEVENTF_ABSOLUTE expects coordinates normalized to a 0..65535
-// range, not raw pixels, so this normalizes against the primary screen's
-// resolution before calling SendInput.
-func MoveMouse(x, y int32) error {
-	screenW := getSystemMetrics(smCXScreen)
-	screenH := getSystemMetrics(smCYScreen)
+// range, not raw pixels, so this normalizes using screenW/screenH before
+// calling SendInput.
+func MoveMouse(x, y, screenW, screenH int32) error {
 	if screenW <= 1 || screenH <= 1 {
-		screenW, screenH = 1920, 1080 // defensive fallback; should not happen on a real display
+		return errors.New("input: invalid screen dimensions")
 	}
 
 	normX := int32((int64(x) * 65535) / int64(screenW-1))

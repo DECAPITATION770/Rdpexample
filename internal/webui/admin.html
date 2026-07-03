@@ -202,6 +202,14 @@ function fetchIceServers() {
 
 // ---------- RemoteSession: one WebRTC PeerConnection to a host ----------
 
+// RemoteSession opens two DataChannels, matching internal/webrtcconn.Peer
+// on the host side: "control" (ordered/reliable — mouse/keyboard/overlay
+// messages) and "video" (unordered, zero-retransmit — screen frame
+// chunks). Putting video on its own unreliable channel matters: an
+// ordered channel delivers strictly in send order, so a multi-chunk
+// video frame in flight would otherwise force every queued mouse-move or
+// keypress to wait behind it — that head-of-line blocking is what made
+// mouse control feel laggy before this split existed.
 class RemoteSession {
   constructor(signaling, session, onScreenFrame, iceServers) {
     this.signaling = signaling;
@@ -209,11 +217,15 @@ class RemoteSession {
     this.onScreenFrame = onScreenFrame;
     this.reassembler = new ScreenFrameReassembler();
     this.pc = new RTCPeerConnection({ iceServers: iceServers || [] });
-    this.dc = this.pc.createDataChannel("control");
-    this.dc.binaryType = "arraybuffer";
-    this.dc.onmessage = (ev) => {
+
+    this.dcControl = this.pc.createDataChannel("control");
+    this.dcControl.binaryType = "arraybuffer";
+
+    this.dcVideo = this.pc.createDataChannel("video", { ordered: false, maxRetransmits: 0 });
+    this.dcVideo.binaryType = "arraybuffer";
+    this.dcVideo.onmessage = (ev) => {
       const chunk = parseScreenFrameChunk(ev.data);
-      if (!chunk) return; // host never sends anything else over this channel
+      if (!chunk) return;
       const complete = this.reassembler.add(chunk.seq, chunk.index, chunk.total, chunk.payload);
       if (complete) this.onScreenFrame(complete);
     };
@@ -244,11 +256,12 @@ class RemoteSession {
   }
 
   send(kind, obj) {
-    if (this.dc.readyState === "open") this.dc.send(encodeFrame(kind, obj));
+    if (this.dcControl.readyState === "open") this.dcControl.send(encodeFrame(kind, obj));
   }
 
   close() {
-    this.dc.close();
+    this.dcControl.close();
+    this.dcVideo.close();
     this.pc.close();
   }
 }

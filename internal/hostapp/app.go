@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -90,6 +91,18 @@ func Run(cfg Config) error {
 	}
 }
 
+// screenBounds holds the exact pixel dimensions of the most recent
+// capture, shared between the capture loop (writer) and incoming
+// InputMouseMove handling (reader) for one session. Using the capture's
+// own bounds — rather than each side independently querying screen
+// resolution — keeps mouse coordinate normalization correct even when
+// Windows DPI scaling makes GetSystemMetrics disagree with what GDI
+// actually captured.
+type screenBounds struct {
+	width  atomic.Int32
+	height atomic.Int32
+}
+
 func handleOffer(signaling *websocket.Conn, cfg Config, env proto.Envelope) {
 	var sdpMsg proto.SDPMessage
 	if err := json.Unmarshal(env.Payload, &sdpMsg); err != nil {
@@ -127,9 +140,10 @@ func handleOffer(signaling *websocket.Conn, cfg Config, env proto.Envelope) {
 	}
 	log.Printf("hostapp: session %s connected", env.SessionID)
 
-	peer.OnData(func(data []byte) { handleDataChannelMessage(data) })
+	bounds := &screenBounds{}
+	peer.OnData(func(data []byte) { handleDataChannelMessage(data, bounds) })
 
-	runCaptureLoop(peer, cfg)
+	runCaptureLoop(peer, cfg, bounds)
 }
 
 // screenFrameChunkSize keeps each DataChannel message well under every
@@ -138,7 +152,7 @@ func handleOffer(signaling *websocket.Conn, cfg Config, env proto.Envelope) {
 // are always split — see internal/proto.EncodeScreenFrameChunks.
 const screenFrameChunkSize = 16 * 1024
 
-func runCaptureLoop(peer *webrtcconn.Peer, cfg Config) {
+func runCaptureLoop(peer *webrtcconn.Peer, cfg Config, bounds *screenBounds) {
 	defer peer.Close()
 
 	ticker := time.NewTicker(cfg.FrameDelay)
@@ -146,16 +160,18 @@ func runCaptureLoop(peer *webrtcconn.Peer, cfg Config) {
 
 	var seq uint32
 	for range ticker.C {
-		jpegBytes, err := capture.GrabPrimaryJPEG(cfg.JPEGQuality)
+		jpegBytes, width, height, err := capture.GrabPrimaryJPEG(cfg.JPEGQuality)
 		if err != nil {
 			log.Printf("hostapp: capture failed: %v", err)
 			continue
 		}
+		bounds.width.Store(width)
+		bounds.height.Store(height)
 		seq++
 
 		disconnected := false
 		for _, chunk := range proto.EncodeScreenFrameChunks(seq, jpegBytes, screenFrameChunkSize) {
-			if err := peer.Send(chunk); err != nil {
+			if err := peer.SendVideo(chunk); err != nil {
 				// A closed/broken data channel means the viewer
 				// disconnected; stop this session's capture loop rather
 				// than spinning on send errors forever.
@@ -178,7 +194,7 @@ func isClosedErr(err error) bool {
 	return strings.Contains(err.Error(), "closed")
 }
 
-func handleDataChannelMessage(data []byte) {
+func handleDataChannelMessage(data []byte, bounds *screenBounds) {
 	msg, err := proto.DecodeFrame(data)
 	if err != nil {
 		log.Printf("hostapp: bad data channel frame: %v", err)
@@ -187,7 +203,7 @@ func handleDataChannelMessage(data []byte) {
 
 	switch m := msg.(type) {
 	case proto.InputEvent:
-		applyInputEvent(m)
+		applyInputEvent(m, bounds)
 	case proto.OverlayMessage:
 		if err := m.Validate(); err != nil {
 			log.Printf("hostapp: invalid overlay message: %v", err)
@@ -206,11 +222,14 @@ func handleDataChannelMessage(data []byte) {
 // SendInput wrapper. Only the left mouse button is wired up — the
 // wrapper doesn't yet distinguish buttons or support the wheel — which
 // matches the MVP's control scope (basic click + move + type).
-func applyInputEvent(evt proto.InputEvent) {
+func applyInputEvent(evt proto.InputEvent, bounds *screenBounds) {
 	var err error
 	switch evt.Kind {
 	case proto.InputMouseMove:
-		err = input.MoveMouse(evt.X, evt.Y)
+		w, h := bounds.width.Load(), bounds.height.Load()
+		if w > 0 && h > 0 {
+			err = input.MoveMouse(evt.X, evt.Y, w, h)
+		}
 	case proto.InputMouseDown:
 		err = input.MouseButton(true)
 	case proto.InputMouseUp:
