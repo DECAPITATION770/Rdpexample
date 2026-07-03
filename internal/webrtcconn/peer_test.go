@@ -151,10 +151,24 @@ func TestPeer_VideoBufferedAmount_TracksAfterConnect(t *testing.T) {
 		t.Fatalf("WaitConnected: %v", err)
 	}
 
-	// Connected with nothing sent yet: buffered amount is 0. This just
-	// proves the method reads the real channel post-connect rather than
-	// always returning the pre-connect zero value from a nil dcVideo.
-	if got := offerer.VideoBufferedAmount(); got != 0 {
-		t.Fatalf("VideoBufferedAmount() right after connect = %d, want 0", got)
+	// Connected with nothing sent yet: buffered amount settles to 0. This
+	// just proves the method reads the real channel post-connect rather
+	// than always returning the pre-connect zero value from a nil
+	// dcVideo. Immediately after WaitConnected returns, pion's DCEP
+	// handshake control message may not have fully flushed from the SCTP
+	// send buffer yet, so VideoBufferedAmount() can transiently report a
+	// small nonzero value even though the channel is open. Poll for it
+	// to settle rather than asserting on a specific instant.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var got uint64
+	for {
+		got = offerer.VideoBufferedAmount()
+		if got == 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got != 0 {
+		t.Fatalf("VideoBufferedAmount() after connect (waited up to 500ms to settle) = %d, want 0", got)
 	}
 }
