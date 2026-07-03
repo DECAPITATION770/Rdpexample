@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"rdpAiAnswer/internal/signaling"
+	"rdpAiAnswer/internal/webui"
 )
 
 func main() {
@@ -13,7 +14,12 @@ func main() {
 	flag.Parse()
 
 	reg := signaling.NewRegistry()
-	handler := signaling.NewHandler(reg)
-	log.Printf("rdp-server listening on %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, handler))
+	sigHandler := signaling.NewHandler(reg)
+
+	mux := http.NewServeMux()
+	mux.Handle("/ws/", sigHandler)
+	mux.Handle("/", webui.Handler())
+
+	log.Printf("rdp-server listening on %s (admin UI at http://localhost%s/)", *addr, *addr)
+	log.Fatal(http.ListenAndServe(*addr, mux))
 }

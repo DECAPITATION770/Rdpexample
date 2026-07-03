@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>RDP-Tool — Admin</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, sans-serif; margin: 0; background: #1e1e1e; color: #eee; }
+  header { padding: 12px 16px; background: #262626; border-bottom: 1px solid #333; display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 15px; margin: 0; flex: 1; }
+  button { background: #333; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 6px 12px; cursor: pointer; }
+  button:hover { background: #3a3a3a; }
+  button.primary { background: #2d6cdf; border-color: #2d6cdf; }
+  #session-list-view { padding: 16px; max-width: 480px; margin: 0 auto; }
+  #sessions { list-style: none; margin: 12px 0; padding: 0; }
+  #sessions li { padding: 10px 12px; margin-bottom: 6px; background: #262626; border-radius: 6px; cursor: pointer; }
+  #sessions li:hover { background: #2f2f2f; }
+  #sessions li.offline { opacity: 0.5; cursor: default; }
+  #control-view { display: flex; height: calc(100vh - 49px); }
+  #screen-wrap { flex: 1; display: flex; align-items: center; justify-content: center; background: #000; overflow: auto; }
+  #screen { max-width: 100%; max-height: 100%; cursor: crosshair; }
+  #sidebar { width: 260px; padding: 16px; background: #262626; border-left: 1px solid #333; display: flex; flex-direction: column; gap: 16px; }
+  .toggle-row { display: flex; flex-direction: column; gap: 4px; padding: 10px; background: #1e1e1e; border-radius: 6px; }
+  .toggle-row .top { display: flex; justify-content: space-between; align-items: center; }
+  .hotkey-label { font-size: 12px; color: #999; }
+  .hint { font-size: 11px; color: #777; }
+  #msg-text { width: 100%; box-sizing: border-box; padding: 6px; background: #1e1e1e; color: #eee; border: 1px solid #444; border-radius: 4px; }
+  #msg-fade { width: 70px; padding: 6px; background: #1e1e1e; color: #eee; border: 1px solid #444; border-radius: 4px; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1 id="header-title">RDP-Tool — Sessions</h1>
+  <button id="back" hidden>&larr; Back</button>
+</header>
+
+<div id="session-list-view">
+  <button id="refresh">Refresh</button>
+  <ul id="sessions"></ul>
+</div>
+
+<div id="control-view" hidden>
+  <div id="screen-wrap">
+    <canvas id="screen" width="800" height="600" tabindex="0"></canvas>
+  </div>
+  <div id="sidebar">
+    <div class="toggle-row">
+      <div class="top">
+        <label><input type="checkbox" id="mouse-toggle"> Mouse</label>
+        <button id="mouse-rebind">Rebind</button>
+      </div>
+      <div class="hotkey-label" id="mouse-hotkey"></div>
+    </div>
+    <div class="toggle-row">
+      <div class="top">
+        <label><input type="checkbox" id="kb-toggle"> Keyboard</label>
+        <button id="kb-rebind">Rebind</button>
+      </div>
+      <div class="hotkey-label" id="kb-hotkey"></div>
+    </div>
+    <div class="toggle-row">
+      <div>Message</div>
+      <input id="msg-text" type="text" placeholder="text near host's cursor">
+      <div class="row">
+        <span class="hint">fade, s</span>
+        <input id="msg-fade" type="number" step="0.1" min="0.1" value="2.0">
+        <button id="msg-send" class="primary">Send</button>
+      </div>
+    </div>
+    <div class="hint">Both toggles start OFF. Click Rebind then press a new key combo to change a hotkey.</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ---------- Wire protocol (must match internal/proto/messages.go) ----------
+
+const FRAME_INPUT_EVENT = 1;
+const FRAME_OVERLAY_MESSAGE = 2;
+const FRAME_SCREEN_FRAME = 3;
+
+function encodeFrame(kind, obj) {
+  const json = new TextEncoder().encode(JSON.stringify(obj));
+  const buf = new ArrayBuffer(5 + json.length);
+  new DataView(buf).setUint8(0, kind);
+  new DataView(buf).setUint32(1, json.length, false); // big-endian, matches encoding/binary.BigEndian
+  new Uint8Array(buf, 5).set(json);
+  return buf;
+}
+
+function decodeFrame(buf) {
+  const view = new DataView(buf);
+  const kind = view.getUint8(0);
+  const length = view.getUint32(1, false);
+  const jsonBytes = new Uint8Array(buf, 5, length);
+  return { kind, obj: JSON.parse(new TextDecoder().decode(jsonBytes)) };
+}
+
+// JS KeyboardEvent.code -> Windows virtual-key code, for internal/input's
+// SendInput wrapper on the host. Covers standard US-layout keys; anything
+// missing from this table is silently not forwarded.
+const CODE_TO_VK = {};
+for (let i = 0; i < 10; i++) CODE_TO_VK["Digit" + i] = 0x30 + i;
+for (let c = 0; c < 26; c++) CODE_TO_VK["Key" + String.fromCharCode(65 + c)] = 0x41 + c;
+Object.assign(CODE_TO_VK, {
+  Backspace: 0x08, Tab: 0x09, Enter: 0x0D, Escape: 0x1B, Space: 0x20,
+  PageUp: 0x21, PageDown: 0x22, End: 0x23, Home: 0x24,
+  ArrowLeft: 0x25, ArrowUp: 0x26, ArrowRight: 0x27, ArrowDown: 0x28, Delete: 0x2E,
+  F1: 0x70, F2: 0x71, F3: 0x72, F4: 0x73, F5: 0x74, F6: 0x75,
+  F7: 0x76, F8: 0x77, F9: 0x78, F10: 0x79, F11: 0x7A, F12: 0x7B,
+  Semicolon: 0xBA, Equal: 0xBB, Comma: 0xBC, Minus: 0xBD, Period: 0xBE, Slash: 0xBF,
+  Backquote: 0xC0, BracketLeft: 0xDB, Backslash: 0xDC, BracketRight: 0xDD, Quote: 0xDE,
+});
+const MODIFIER_CODES = new Set(["ControlLeft", "ControlRight", "AltLeft", "AltRight", "ShiftLeft", "ShiftRight", "MetaLeft", "MetaRight"]);
+
+// ---------- SignalingClient: one WebSocket to the server's /ws/viewer ----------
+
+class SignalingClient {
+  constructor(onSessionList, onAnswer) {
+    const base = location.origin.replace(/^http/, "ws");
+    this.ws = new WebSocket(base + "/ws/viewer");
+    this.onSessionList = onSessionList;
+    this.onAnswer = onAnswer;
+    this.ws.onmessage = (ev) => this._handle(JSON.parse(ev.data));
+  }
+
+  _handle(env) {
+    if (env.type === "session_list") this.onSessionList(env.payload.sessions || []);
+    else if (env.type === "answer") this.onAnswer(env.payload.sdp);
+    // ice_candidate is unused: both sides wait for full ICE gathering
+    // before exchanging SDP (non-trickle), so candidates already ride
+    // along inside the offer/answer SDP itself.
+  }
+
+  requestSessionList() {
+    this.ws.send(JSON.stringify({ type: "list_sessions" }));
+  }
+
+  sendOffer(sessionId, sdp) {
+    this.ws.send(JSON.stringify({ type: "offer", session_id: sessionId, payload: { sdp } }));
+  }
+}
+
+// ---------- RemoteSession: one WebRTC PeerConnection to a host ----------
+
+class RemoteSession {
+  constructor(signaling, session, onFrame) {
+    this.signaling = signaling;
+    this.session = session;
+    this.onFrame = onFrame;
+    this.pc = new RTCPeerConnection({ iceServers: [] });
+    this.dc = this.pc.createDataChannel("control");
+    this.dc.binaryType = "arraybuffer";
+    this.dc.onmessage = (ev) => this.onFrame(decodeFrame(ev.data));
+  }
+
+  async connect() {
+    const offer = await this.pc.createOffer();
+    await this.pc.setLocalDescription(offer);
+    await this._waitIceGatheringComplete();
+    this.signaling.sendOffer(this.session.session_id, this.pc.localDescription.sdp);
+  }
+
+  async acceptAnswer(sdp) {
+    await this.pc.setRemoteDescription({ type: "answer", sdp });
+  }
+
+  _waitIceGatheringComplete() {
+    if (this.pc.iceGatheringState === "complete") return Promise.resolve();
+    return new Promise((resolve) => {
+      const check = () => {
+        if (this.pc.iceGatheringState === "complete") {
+          this.pc.removeEventListener("icegatheringstatechange", check);
+          resolve();
+        }
+      };
+      this.pc.addEventListener("icegatheringstatechange", check);
+    });
+  }
+
+  send(kind, obj) {
+    if (this.dc.readyState === "open") this.dc.send(encodeFrame(kind, obj));
+  }
+
+  close() {
+    this.dc.close();
+    this.pc.close();
+  }
+}
+
+// ---------- Hotkey combo persistence (localStorage) ----------
+
+function loadCombo(key, def) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw) return JSON.parse(raw);
+  } catch (e) { /* ignore malformed storage */ }
+  return def;
+}
+function saveCombo(key, combo) { localStorage.setItem(key, JSON.stringify(combo)); }
+function comboFromEvent(e) { return { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, code: e.code }; }
+function comboEquals(a, b) { return a.ctrl === b.ctrl && a.alt === b.alt && a.shift === b.shift && a.code === b.code; }
+function comboLabel(c) {
+  const parts = [];
+  if (c.ctrl) parts.push("Ctrl");
+  if (c.alt) parts.push("Alt");
+  if (c.shift) parts.push("Shift");
+  parts.push(c.code.replace(/^Key|^Digit/, ""));
+  return parts.join("+");
+}
+
+// ---------- App state + UI wiring ----------
+
+const els = {
+  headerTitle: document.getElementById("header-title"),
+  back: document.getElementById("back"),
+  listView: document.getElementById("session-list-view"),
+  controlView: document.getElementById("control-view"),
+  sessions: document.getElementById("sessions"),
+  refresh: document.getElementById("refresh"),
+  screen: document.getElementById("screen"),
+  mouseToggle: document.getElementById("mouse-toggle"),
+  mouseRebind: document.getElementById("mouse-rebind"),
+  mouseHotkey: document.getElementById("mouse-hotkey"),
+  kbToggle: document.getElementById("kb-toggle"),
+  kbRebind: document.getElementById("kb-rebind"),
+  kbHotkey: document.getElementById("kb-hotkey"),
+  msgText: document.getElementById("msg-text"),
+  msgFade: document.getElementById("msg-fade"),
+  msgSend: document.getElementById("msg-send"),
+};
+
+let sessions = [];
+let mouseCombo = loadCombo("rdp.mouseCombo", { ctrl: true, alt: true, shift: false, code: "KeyM" });
+let kbCombo = loadCombo("rdp.kbCombo", { ctrl: true, alt: true, shift: false, code: "KeyK" });
+let rebinding = null; // "mouse" | "keyboard" | null
+let remote = null; // active RemoteSession
+
+function updateHotkeyLabels() {
+  els.mouseHotkey.textContent = mouseCombo ? comboLabel(mouseCombo) : "";
+  els.kbHotkey.textContent = kbCombo ? comboLabel(kbCombo) : "";
+}
+updateHotkeyLabels();
+
+const signaling = new SignalingClient(
+  (list) => { sessions = list; renderSessions(); },
+  (sdp) => { if (remote) remote.acceptAnswer(sdp); }
+);
+
+function renderSessions() {
+  els.sessions.innerHTML = "";
+  for (const s of sessions) {
+    const li = document.createElement("li");
+    li.textContent = (s.online ? "\u{1F7E2} " : "⚪ ") + s.name;
+    if (!s.online) li.classList.add("offline");
+    else li.addEventListener("click", () => openSession(s));
+    els.sessions.appendChild(li);
+  }
+}
+
+els.refresh.addEventListener("click", () => signaling.requestSessionList());
+signaling.ws.addEventListener("open", () => signaling.requestSessionList());
+
+function openSession(session) {
+  els.headerTitle.textContent = session.name;
+  els.back.hidden = false;
+  els.listView.hidden = true;
+  els.controlView.hidden = false;
+  els.mouseToggle.checked = false;
+  els.kbToggle.checked = false;
+
+  remote = new RemoteSession(signaling, session, ({ kind, obj }) => {
+    if (kind === FRAME_SCREEN_FRAME) renderScreenFrame(obj);
+  });
+  remote.connect();
+}
+
+els.back.addEventListener("click", () => {
+  if (remote) { remote.close(); remote = null; }
+  els.back.hidden = true;
+  els.listView.hidden = false;
+  els.controlView.hidden = true;
+  els.headerTitle.textContent = "RDP-Tool — Sessions";
+});
+
+function renderScreenFrame(frame) {
+  const img = new Image();
+  img.onload = () => {
+    if (els.screen.width !== img.width || els.screen.height !== img.height) {
+      els.screen.width = img.width;
+      els.screen.height = img.height;
+    }
+    els.screen.getContext("2d").drawImage(img, 0, 0);
+  };
+  img.src = "data:image/jpeg;base64," + frame.jpeg;
+}
+
+// ---------- Mouse control ----------
+
+els.mouseToggle.addEventListener("change", () => { /* checkbox is the source of truth, read directly */ });
+
+els.screen.addEventListener("mousemove", (e) => {
+  if (!els.mouseToggle.checked || !remote) return;
+  const rect = els.screen.getBoundingClientRect();
+  const x = Math.round(((e.clientX - rect.left) / rect.width) * els.screen.width);
+  const y = Math.round(((e.clientY - rect.top) / rect.height) * els.screen.height);
+  remote.send(FRAME_INPUT_EVENT, { kind: "mouse_move", x, y });
+});
+els.screen.addEventListener("mousedown", () => {
+  if (!els.mouseToggle.checked || !remote) return;
+  remote.send(FRAME_INPUT_EVENT, { kind: "mouse_down" });
+});
+els.screen.addEventListener("mouseup", () => {
+  if (!els.mouseToggle.checked || !remote) return;
+  remote.send(FRAME_INPUT_EVENT, { kind: "mouse_up" });
+});
+els.screen.addEventListener("contextmenu", (e) => e.preventDefault());
+
+// ---------- Keyboard control + hotkeys + rebind ----------
+
+els.mouseRebind.addEventListener("click", () => { rebinding = "mouse"; els.mouseRebind.textContent = "Press keys..."; });
+els.kbRebind.addEventListener("click", () => { rebinding = "keyboard"; els.kbRebind.textContent = "Press keys..."; });
+
+function isTypingTarget(el) {
+  return el && (el.id === "msg-text" || el.id === "msg-fade");
+}
+
+document.addEventListener("keydown", (e) => {
+  if (rebinding) {
+    if (MODIFIER_CODES.has(e.code)) return; // wait for a real, non-modifier key
+    e.preventDefault();
+    const combo = comboFromEvent(e);
+    if (rebinding === "mouse") { mouseCombo = combo; saveCombo("rdp.mouseCombo", combo); els.mouseRebind.textContent = "Rebind"; }
+    else { kbCombo = combo; saveCombo("rdp.kbCombo", combo); els.kbRebind.textContent = "Rebind"; }
+    updateHotkeyLabels();
+    rebinding = null;
+    return;
+  }
+
+  if (isTypingTarget(document.activeElement)) return;
+
+  const combo = comboFromEvent(e);
+  if (!MODIFIER_CODES.has(e.code) && comboEquals(combo, mouseCombo)) {
+    e.preventDefault();
+    els.mouseToggle.checked = !els.mouseToggle.checked;
+    return;
+  }
+  if (!MODIFIER_CODES.has(e.code) && comboEquals(combo, kbCombo)) {
+    e.preventDefault();
+    els.kbToggle.checked = !els.kbToggle.checked;
+    return;
+  }
+
+  if (els.kbToggle.checked && remote) {
+    const vk = CODE_TO_VK[e.code];
+    if (vk) {
+      e.preventDefault();
+      remote.send(FRAME_INPUT_EVENT, { kind: "key_down", key_vk: vk });
+    }
+  }
+});
+
+document.addEventListener("keyup", (e) => {
+  if (rebinding || isTypingTarget(document.activeElement)) return;
+  if (els.kbToggle.checked && remote) {
+    const vk = CODE_TO_VK[e.code];
+    if (vk) remote.send(FRAME_INPUT_EVENT, { kind: "key_up", key_vk: vk });
+  }
+});
+
+// ---------- Overlay message ----------
+
+els.msgSend.addEventListener("click", () => {
+  if (!remote) return;
+  const text = els.msgText.value;
+  if (!text) return;
+  let fade = parseFloat(els.msgFade.value);
+  if (isNaN(fade) || fade <= 0) fade = 2.0;
+  fade = Math.round(fade * 10) / 10;
+  remote.send(FRAME_OVERLAY_MESSAGE, { text, fade_seconds: fade });
+  els.msgText.value = "";
+});
+</script>
+</body>
+</html>

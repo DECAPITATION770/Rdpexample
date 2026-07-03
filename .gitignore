@@ -3,3 +3,5 @@
 .DS_Store
 .worktrees/
 worktrees/
+.claude/
+.playwright-mcp/
