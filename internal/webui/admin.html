@@ -19,6 +19,7 @@
   #control-view { display: flex; height: calc(100vh - 49px); }
   #screen-wrap { position: relative; flex: 1; display: flex; align-items: center; justify-content: center; background: #000; overflow: auto; }
   #screen { max-width: 100%; max-height: 100%; cursor: crosshair; }
+  #screen-http { max-width: 100%; max-height: 100%; cursor: crosshair; }
   #toolbar { position: absolute; top: 10px; right: 10px; z-index: 5; display: flex; align-items: center; gap: 6px; }
   #toolbar button { font-size: 12px; opacity: 0.8; }
   #toolbar button:hover { opacity: 1; }
@@ -64,10 +65,12 @@
   <div id="screen-wrap">
     <div id="toolbar">
       <span id="status-badge">connecting…</span>
+      <button id="transport-toggle" title="Switch between WebRTC and HTTP">⇄ HTTP</button>
       <button id="shot-btn" title="Grab a one-off screenshot">📷</button>
       <button id="expand-btn">⛶ Expand</button>
     </div>
     <canvas id="screen" width="800" height="600" tabindex="0"></canvas>
+    <img id="screen-http" hidden alt="live view (HTTP)">
   </div>
   <div id="sidebar">
     <div class="toggle-row">
@@ -218,6 +221,18 @@ class SignalingClient {
   requestScreenshot(sessionId) {
     this.ws.send(JSON.stringify({ type: "request_screenshot", session_id: sessionId }));
   }
+
+  // sendInputEvent/sendOverlayMessage carry mouse/keyboard/overlay
+  // messages over the signaling WebSocket instead of a WebRTC
+  // DataChannel — used by the HTTP/MJPEG fallback transport, which has
+  // no PeerConnection at all.
+  sendInputEvent(sessionId, evt) {
+    this.ws.send(JSON.stringify({ type: "input_event", session_id: sessionId, payload: evt }));
+  }
+
+  sendOverlayMessage(sessionId, msg) {
+    this.ws.send(JSON.stringify({ type: "overlay_message", session_id: sessionId, payload: msg }));
+  }
 }
 
 // ---------- ICE server config, fetched once from the server ----------
@@ -330,6 +345,8 @@ const els = {
   sessions: document.getElementById("sessions"),
   refresh: document.getElementById("refresh"),
   screen: document.getElementById("screen"),
+  screenHttp: document.getElementById("screen-http"),
+  transportToggle: document.getElementById("transport-toggle"),
   mouseToggle: document.getElementById("mouse-toggle"),
   mouseRebind: document.getElementById("mouse-rebind"),
   mouseHotkey: document.getElementById("mouse-hotkey"),
@@ -367,6 +384,33 @@ let connectTimeoutHandle = null;
 function setStatus(text, cls) {
   els.statusBadge.textContent = text;
   els.statusBadge.className = cls || "";
+}
+
+// ---------- Transport switch (WebRTC <-> HTTP/MJPEG fallback) ----------
+
+let transportMode = "webrtc"; // "webrtc" | "http"
+
+function activeSurfaceEl() {
+  return transportMode === "http" ? els.screenHttp : els.screen;
+}
+
+function activeSurfaceSize() {
+  const el = activeSurfaceEl();
+  return transportMode === "http"
+    ? { width: el.naturalWidth, height: el.naturalHeight }
+    : { width: el.width, height: el.height };
+}
+
+// sendInput dispatches a mouse/keyboard event over whichever transport is
+// currently active: the WebRTC control DataChannel, or (in HTTP fallback
+// mode, where there's no PeerConnection at all) the signaling WebSocket.
+function sendInput(kind, obj) {
+  if (!currentSession) return;
+  if (transportMode === "webrtc") {
+    if (remote) remote.send(FRAME_INPUT_EVENT, { kind, ...obj });
+  } else {
+    signaling.sendInputEvent(currentSession.session_id, { kind, ...obj });
+  }
 }
 
 function updateHotkeyLabels() {
@@ -425,6 +469,7 @@ els.shotBtn.addEventListener("click", () => {
 
 async function openSession(session) {
   currentSession = session;
+  transportMode = "webrtc";
   els.headerTitle.textContent = session.name;
   els.back.hidden = false;
   els.listView.hidden = true;
@@ -436,7 +481,10 @@ async function openSession(session) {
   setStatus("connecting…", "");
   clearTimeout(connectTimeoutHandle);
   connectTimeoutHandle = setTimeout(() => {
-    if (!gotFirstFrame) setStatus("⚠ no connection — retry?", "failed");
+    if (!gotFirstFrame) {
+      setStatus("⚠ WebRTC timed out — switching to HTTP", "failed");
+      switchTransport("http");
+    }
   }, WEBRTC_CONNECT_TIMEOUT_MS);
 
   const iceServers = await fetchIceServers();
@@ -444,10 +492,55 @@ async function openSession(session) {
   remote.connect();
 }
 
+// switchTransport tears down/creates the resources for the given
+// transport and flips which surface element (canvas vs <img>) is visible.
+// Called both automatically (connect timeout) and manually (toolbar
+// toggle button).
+function switchTransport(mode) {
+  if (!currentSession) return;
+  transportMode = mode;
+  if (mode === "http") {
+    if (remote) { remote.close(); remote = null; }
+    clearTimeout(connectTimeoutHandle);
+    els.screen.hidden = true;
+    els.screenHttp.hidden = false;
+    els.screenHttp.src = "/stream/" + currentSession.session_id;
+    setStatus("🟠 HTTP relay", "");
+    els.transportToggle.textContent = "⇄ WebRTC";
+  } else {
+    els.screenHttp.src = "";
+    els.screenHttp.hidden = true;
+    els.screen.hidden = false;
+    els.transportToggle.textContent = "⇄ HTTP";
+    gotFirstFrame = false;
+    setStatus("connecting…", "");
+    (async () => {
+      const iceServers = await fetchIceServers();
+      remote = new RemoteSession(signaling, currentSession, renderScreenFrame, iceServers);
+      remote.connect();
+      clearTimeout(connectTimeoutHandle);
+      connectTimeoutHandle = setTimeout(() => {
+        if (!gotFirstFrame) {
+          setStatus("⚠ WebRTC timed out — switching to HTTP", "failed");
+          switchTransport("http");
+        }
+      }, WEBRTC_CONNECT_TIMEOUT_MS);
+    })();
+  }
+}
+
+els.transportToggle.addEventListener("click", () => {
+  switchTransport(transportMode === "webrtc" ? "http" : "webrtc");
+});
+
 els.back.addEventListener("click", () => {
   clearTimeout(connectTimeoutHandle);
   if (remote) { remote.close(); remote = null; }
   currentSession = null;
+  transportMode = "webrtc";
+  els.screenHttp.src = "";
+  els.screenHttp.hidden = true;
+  els.screen.hidden = false;
   els.back.hidden = true;
   els.listView.hidden = false;
   els.controlView.hidden = true;
@@ -483,22 +576,32 @@ function renderScreenFrame(jpegBytes) {
 
 els.mouseToggle.addEventListener("change", () => { /* checkbox is the source of truth, read directly */ });
 
-els.screen.addEventListener("mousemove", (e) => {
-  if (!els.mouseToggle.checked || !remote) return;
-  const rect = els.screen.getBoundingClientRect();
-  const x = Math.round(((e.clientX - rect.left) / rect.width) * els.screen.width);
-  const y = Math.round(((e.clientY - rect.top) / rect.height) * els.screen.height);
-  remote.send(FRAME_INPUT_EVENT, { kind: "mouse_move", x, y });
-});
-els.screen.addEventListener("mousedown", () => {
-  if (!els.mouseToggle.checked || !remote) return;
-  remote.send(FRAME_INPUT_EVENT, { kind: "mouse_down" });
-});
-els.screen.addEventListener("mouseup", () => {
-  if (!els.mouseToggle.checked || !remote) return;
-  remote.send(FRAME_INPUT_EVENT, { kind: "mouse_up" });
-});
-els.screen.addEventListener("contextmenu", (e) => e.preventDefault());
+// wireMouseControl is attached to both the canvas (WebRTC) and the <img>
+// (HTTP fallback) surfaces. Only one is ever visible at a time — the
+// hidden one doesn't receive real pointer events — so there's no need to
+// gate on transportMode here; activeSurfaceSize()/sendInput() already
+// route to whichever transport is live.
+function wireMouseControl(el) {
+  el.addEventListener("mousemove", (e) => {
+    if (!els.mouseToggle.checked || !currentSession) return;
+    const rect = el.getBoundingClientRect();
+    const size = activeSurfaceSize();
+    const x = Math.round(((e.clientX - rect.left) / rect.width) * size.width);
+    const y = Math.round(((e.clientY - rect.top) / rect.height) * size.height);
+    sendInput("mouse_move", { x, y });
+  });
+  el.addEventListener("mousedown", () => {
+    if (!els.mouseToggle.checked || !currentSession) return;
+    sendInput("mouse_down", {});
+  });
+  el.addEventListener("mouseup", () => {
+    if (!els.mouseToggle.checked || !currentSession) return;
+    sendInput("mouse_up", {});
+  });
+  el.addEventListener("contextmenu", (e) => e.preventDefault());
+}
+wireMouseControl(els.screen);
+wireMouseControl(els.screenHttp);
 
 // ---------- Keyboard control + hotkeys + rebind ----------
 
@@ -535,33 +638,37 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
-  if (els.kbToggle.checked && remote) {
+  if (els.kbToggle.checked && currentSession) {
     const vk = CODE_TO_VK[e.code];
     if (vk) {
       e.preventDefault();
-      remote.send(FRAME_INPUT_EVENT, { kind: "key_down", key_vk: vk });
+      sendInput("key_down", { key_vk: vk });
     }
   }
 });
 
 document.addEventListener("keyup", (e) => {
   if (rebinding || isTypingTarget(document.activeElement)) return;
-  if (els.kbToggle.checked && remote) {
+  if (els.kbToggle.checked && currentSession) {
     const vk = CODE_TO_VK[e.code];
-    if (vk) remote.send(FRAME_INPUT_EVENT, { kind: "key_up", key_vk: vk });
+    if (vk) sendInput("key_up", { key_vk: vk });
   }
 });
 
 // ---------- Overlay message ----------
 
 els.msgSend.addEventListener("click", () => {
-  if (!remote) return;
+  if (!currentSession) return;
   const text = els.msgText.value;
   if (!text) return;
   let fade = parseFloat(els.msgFade.value);
   if (isNaN(fade) || fade <= 0) fade = 2.0;
   fade = Math.round(fade * 10) / 10;
-  remote.send(FRAME_OVERLAY_MESSAGE, { text, fade_seconds: fade });
+  if (transportMode === "webrtc") {
+    if (remote) remote.send(FRAME_OVERLAY_MESSAGE, { text, fade_seconds: fade });
+  } else {
+    signaling.sendOverlayMessage(currentSession.session_id, { text, fade_seconds: fade });
+  }
   els.msgText.value = "";
 });
 </script>
