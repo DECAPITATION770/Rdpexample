@@ -3,6 +3,7 @@
 package overlay
 
 import (
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -30,6 +31,8 @@ const (
 	dtNoClip     = 0x00000100
 
 	bkModeTransparent = 1
+
+	pmRemove = 0x0001
 )
 
 func rgb(r, g, b byte) uint32 {
@@ -58,6 +61,9 @@ var (
 	procGetDC                 = user32.NewProc("GetDC")
 	procReleaseDC             = user32.NewProc("ReleaseDC")
 	procDrawText              = user32.NewProc("DrawTextW")
+	procPeekMessage           = user32.NewProc("PeekMessageW")
+	procTranslateMessage      = user32.NewProc("TranslateMessage")
+	procDispatchMessage       = user32.NewProc("DispatchMessageW")
 	procGetModuleHandle       = kernel32.NewProc("GetModuleHandleW")
 
 	procSetBkMode            = gdi32.NewProc("SetBkMode")
@@ -71,6 +77,19 @@ type point struct{ X, Y int32 }
 type rect struct{ Left, Top, Right, Bottom int32 }
 
 type sizeXY struct{ CX, CY int32 }
+
+// msgStruct mirrors Win32's MSG. Field order matches the C layout, and
+// Go's natural alignment on amd64 inserts the same padding C would (4
+// bytes after Message so WParam lands on an 8-byte boundary) — same
+// approach as wndClassExW below.
+type msgStruct struct {
+	Hwnd    uintptr
+	Message uint32
+	WParam  uintptr
+	LParam  uintptr
+	Time    uint32
+	Pt      point
+}
 
 type paintStruct struct {
 	HDC         uintptr
@@ -250,6 +269,20 @@ func createOverlayWindow(text string, x, y int32) (uintptr, error) {
 // the duration of the fade — callers should run this in its own
 // goroutine per incoming overlay message.
 func ShowMessage(text string, fadeDuration time.Duration) error {
+	// A window's message queue is thread-affine in Win32: only the
+	// thread that created the window can pump messages for it via
+	// PeekMessage/DispatchMessage. Go goroutines aren't pinned to an OS
+	// thread by default, so without LockOSThread the runtime could hop
+	// this goroutine across threads between CreateWindowExW and the
+	// message loop below — and without a message loop running on the
+	// right thread at all, WM_PAINT never reaches paintOverlay: the
+	// window just sits there showing whatever blank surface Windows
+	// defaults to, never draws the text, and never processes WM_DESTROY
+	// either. Locking for the whole call keeps window creation and the
+	// message pump on the same OS thread throughout.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	var cursor point
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&cursor)))
 
@@ -272,7 +305,21 @@ func ShowMessage(text string, fadeDuration time.Duration) error {
 	ticker := time.NewTicker(33 * time.Millisecond) // ~30fps fade
 	defer ticker.Stop()
 
+	var msg msgStruct
 	for range ticker.C {
+		// Drain this thread's message queue so WM_PAINT (and everything
+		// else, e.g. the eventual WM_NCDESTROY) actually gets dispatched
+		// to windowProcCallback — see the LockOSThread comment above for
+		// why this has to happen on this same thread.
+		for {
+			has, _, _ := procPeekMessage.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0, pmRemove)
+			if has == 0 {
+				break
+			}
+			procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+			procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
+		}
+
 		elapsed := time.Since(start)
 		opacity := timer.Opacity(elapsed)
 		alpha := uintptr(opacity * 255)
