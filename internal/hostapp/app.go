@@ -121,6 +121,10 @@ func Run(cfg Config) error {
 				continue
 			}
 			showOverlayMessage(msg)
+		case proto.MsgStartFrameRelay:
+			go runFrameRelayLoop(conn, cfg, bounds, env.SessionID)
+		case proto.MsgStopFrameRelay:
+			stopFrameRelay(env.SessionID)
 		default:
 			// MsgICECandidate is relayed by the signaling server but
 			// unused here: webrtcconn.Peer waits for full ICE gathering
@@ -270,6 +274,64 @@ func runCaptureLoop(peer *webrtcconn.Peer, cfg Config, bounds *screenBounds) {
 
 func isClosedErr(err error) bool {
 	return strings.Contains(err.Error(), "closed")
+}
+
+var (
+	frameRelayMu    sync.Mutex
+	frameRelayStops = map[string]chan struct{}{}
+)
+
+func stopFrameRelay(sessionID string) {
+	frameRelayMu.Lock()
+	defer frameRelayMu.Unlock()
+	if stop, ok := frameRelayStops[sessionID]; ok {
+		close(stop)
+		delete(frameRelayStops, sessionID)
+	}
+}
+
+// runFrameRelayLoop pushes JPEG frames to the signaling server for the
+// HTTP/MJPEG fallback, independent of any WebRTC PeerConnection. Unlike
+// the WebRTC video path, this doesn't need an explicit buffered-amount
+// check: conn.WriteJSON writes straight through to the underlying TCP
+// socket, so if the signaling link is backed up the write blocks, and
+// time.Ticker already drops ticks that occur while its consumer is busy
+// — there is no separate unbounded send queue for this leg to overflow.
+func runFrameRelayLoop(conn *safeConn, cfg Config, bounds *screenBounds, sessionID string) {
+	stop := make(chan struct{})
+	frameRelayMu.Lock()
+	frameRelayStops[sessionID] = stop
+	frameRelayMu.Unlock()
+	defer stopFrameRelay(sessionID)
+
+	ticker := time.NewTicker(cfg.FrameDelay)
+	defer ticker.Stop()
+
+	log.Printf("hostapp: starting HTTP frame relay for session %s", sessionID)
+	for {
+		select {
+		case <-stop:
+			log.Printf("hostapp: stopping HTTP frame relay for session %s", sessionID)
+			return
+		case <-ticker.C:
+			jpegBytes, width, height, err := capture.GrabPrimaryJPEG(cfg.JPEGQuality)
+			if err != nil {
+				log.Printf("hostapp: relay capture failed: %v", err)
+				continue
+			}
+			bounds.width.Store(width)
+			bounds.height.Store(height)
+
+			payload, err := json.Marshal(proto.RelayFrameMessage{JPEG: jpegBytes})
+			if err != nil {
+				continue
+			}
+			if err := conn.WriteJSON(proto.Envelope{Type: proto.MsgRelayFrame, SessionID: sessionID, Payload: payload}); err != nil {
+				log.Printf("hostapp: relay frame send failed: %v", err)
+				return
+			}
+		}
+	}
 }
 
 func handleDataChannelMessage(data []byte, bounds *screenBounds) {
