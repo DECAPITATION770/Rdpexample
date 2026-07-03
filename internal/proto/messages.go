@@ -25,9 +25,15 @@ const (
 	MsgScreenshot        MsgType = "screenshot"
 	MsgInputEvent        MsgType = "input_event"       // viewer -> host, relayed: proto.InputEvent payload
 	MsgOverlayMessage    MsgType = "overlay_message"   // viewer -> host, relayed: proto.OverlayMessage payload
-	MsgStartFrameRelay   MsgType = "start_frame_relay" // server -> host: begin pushing RelayFrameMessages
+	MsgStartFrameRelay   MsgType = "start_frame_relay" // server -> host: begin pushing binary frames (see below)
 	MsgStopFrameRelay    MsgType = "stop_frame_relay"  // server -> host: stop pushing them
-	MsgRelayFrame        MsgType = "relay_frame"       // host -> server: one JPEG frame for the HTTP fan-out
+	// Relayed JPEG frames (host -> server, for the HTTP/MJPEG fallback's
+	// FrameBroadcaster) are NOT an Envelope/MsgType at all — they ride the
+	// same signaling connection as a raw WebSocket *binary* message,
+	// distinguished from these JSON envelopes (always sent as WebSocket
+	// text messages) by WebSocket message type rather than an in-payload
+	// marker. See internal/hostapp's runFrameRelayLoop and
+	// internal/signaling's handleHost.
 )
 
 type Envelope struct {
@@ -66,16 +72,6 @@ type ICECandidateMessage struct {
 // []byte field; a single low-res preview is small enough that the ~33%
 // base64 overhead doesn't matter the way it would for the video stream.
 type ScreenshotMessage struct {
-	JPEG []byte `json:"jpeg"`
-}
-
-// RelayFrameMessage carries one JPEG frame from host to the signaling
-// server for the HTTP/MJPEG fallback path (see internal/signaling's
-// FrameBroadcaster). Distinct from ScreenshotMessage even though the
-// shape is identical — that one is a single on-demand preview, this one
-// is a continuous stream, and keeping the types separate keeps intent
-// clear at call sites.
-type RelayFrameMessage struct {
 	JPEG []byte `json:"jpeg"`
 }
 

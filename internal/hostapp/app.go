@@ -42,6 +42,18 @@ func (c *safeConn) WriteJSON(v any) error {
 	return c.conn.WriteJSON(v)
 }
 
+// WriteBinary sends data as a raw WebSocket binary message — used only
+// by the frame-relay path (see runFrameRelayLoop), which the signaling
+// server distinguishes from JSON envelopes by WebSocket message type
+// rather than an in-payload marker. Binary avoids both the ~33% size
+// overhead of JSON's automatic base64-encoding of []byte fields and the
+// JSON marshal/unmarshal CPU cost on every single frame.
+func (c *safeConn) WriteBinary(data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteMessage(websocket.BinaryMessage, data)
+}
+
 func (c *safeConn) ReadJSON(v any) error { return c.conn.ReadJSON(v) }
 func (c *safeConn) Close() error         { return c.conn.Close() }
 
@@ -313,10 +325,21 @@ func stopFrameRelay(sessionID string) {
 	}
 }
 
+// relayFrameDelay is the HTTP/MJPEG fallback's own capture interval,
+// independent of cfg.FrameDelay (the WebRTC path's rate). It's
+// deliberately more aggressive than the WebRTC default: this leg sends
+// raw binary frames with none of the DataChannel chunking overhead, and
+// the drop-stale-frame behavior throughout this path (see the
+// WriteBinary/time.Ticker comment below, and FrameBroadcaster.Publish)
+// means asking for more than the pipe can sustain just self-throttles
+// back down instead of building a backlog — so there's no real downside
+// to aiming high here.
+const relayFrameDelay = 33 * time.Millisecond // ~30fps target
+
 // runFrameRelayLoop pushes JPEG frames to the signaling server for the
 // HTTP/MJPEG fallback, independent of any WebRTC PeerConnection. Unlike
 // the WebRTC video path, this doesn't need an explicit buffered-amount
-// check: conn.WriteJSON writes straight through to the underlying TCP
+// check: conn.WriteBinary writes straight through to the underlying TCP
 // socket, so if the signaling link is backed up the write blocks, and
 // time.Ticker already drops ticks that occur while its consumer is busy
 // — there is no separate unbounded send queue for this leg to overflow.
@@ -334,7 +357,7 @@ func runFrameRelayLoop(conn *safeConn, cfg Config, bounds *screenBounds, session
 	frameRelayMu.Unlock()
 	defer stopFrameRelay(sessionID)
 
-	ticker := time.NewTicker(cfg.FrameDelay)
+	ticker := time.NewTicker(relayFrameDelay)
 	defer ticker.Stop()
 
 	log.Printf("hostapp: starting HTTP frame relay for session %s", sessionID)
@@ -352,11 +375,7 @@ func runFrameRelayLoop(conn *safeConn, cfg Config, bounds *screenBounds, session
 			bounds.width.Store(width)
 			bounds.height.Store(height)
 
-			payload, err := json.Marshal(proto.RelayFrameMessage{JPEG: jpegBytes})
-			if err != nil {
-				continue
-			}
-			if err := conn.WriteJSON(proto.Envelope{Type: proto.MsgRelayFrame, SessionID: sessionID, Payload: payload}); err != nil {
+			if err := conn.WriteBinary(jpegBytes); err != nil {
 				log.Printf("hostapp: relay frame send failed: %v", err)
 				return
 			}

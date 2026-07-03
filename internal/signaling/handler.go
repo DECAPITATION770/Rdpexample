@@ -38,6 +38,17 @@ func (c *safeConn) WriteJSON(v any) error {
 func (c *safeConn) ReadJSON(v any) error { return c.conn.ReadJSON(v) }
 func (c *safeConn) Close() error         { return c.conn.Close() }
 
+// ReadMessage returns the raw WebSocket message type and payload. Only
+// handleHost uses this directly (instead of ReadJSON) — it needs to see
+// the message type first, since relayed frames arrive as a raw binary
+// message on the same connection as the JSON envelopes used for
+// everything else. Reads are never concurrent (only the owning
+// handleHost/handleViewer goroutine reads), so this needs no locking,
+// matching ReadJSON above.
+func (c *safeConn) ReadMessage() (messageType int, data []byte, err error) {
+	return c.conn.ReadMessage()
+}
+
 // Handler routes host and viewer WebSocket connections. Host connections
 // register themselves and stay open (registration lives as long as the
 // socket does). Viewer connections request the session list and relay
@@ -130,14 +141,31 @@ func (h *Handler) handleHost(w http.ResponseWriter, r *http.Request) {
 
 	var sessionID string
 	for {
-		var env proto.Envelope
-		if err := conn.ReadJSON(&env); err != nil {
+		messageType, data, err := conn.ReadMessage()
+		if err != nil {
 			if sessionID != "" {
 				h.reg.Unregister(sessionID)
 				h.removeHost(sessionID)
 				log.Printf("signaling: host session %s disconnected (%v)", sessionID, err)
 			}
 			return
+		}
+
+		// Relayed HTTP/MJPEG-fallback frames ride this same connection as
+		// raw binary WebSocket messages instead of JSON envelopes — see
+		// runFrameRelayLoop/WriteBinary in internal/hostapp — so the frame
+		// itself never needs parsing, just handing to the broadcaster.
+		if messageType == websocket.BinaryMessage {
+			if sessionID != "" {
+				h.broadcaster(sessionID).Publish(data)
+			}
+			continue
+		}
+
+		var env proto.Envelope
+		if err := json.Unmarshal(data, &env); err != nil {
+			log.Printf("signaling: bad envelope from host: %v", err)
+			continue
 		}
 		switch env.Type {
 		case proto.MsgRegisterHost:
@@ -156,12 +184,6 @@ func (h *Handler) handleHost(w http.ResponseWriter, r *http.Request) {
 			} else {
 				log.Printf("signaling: host %s sent %s but no viewer is attached to this session", sessionID, env.Type)
 			}
-		case proto.MsgRelayFrame:
-			var frame proto.RelayFrameMessage
-			if err := json.Unmarshal(env.Payload, &frame); err != nil {
-				continue
-			}
-			h.broadcaster(sessionID).Publish(frame.JPEG)
 		}
 	}
 }

@@ -76,9 +76,10 @@ func TestHandler_StreamEndpoint_DeliversFramesAndSignalsHostStartStop(t *testing
 		t.Fatalf("parse content-type: %v", err)
 	}
 
-	// Host pushes one frame.
-	framePayload, _ := json.Marshal(proto.RelayFrameMessage{JPEG: []byte("fake-jpeg-bytes")})
-	if err := hostConn.WriteJSON(proto.Envelope{Type: proto.MsgRelayFrame, SessionID: sessionID, Payload: framePayload}); err != nil {
+	// Host pushes one frame as a raw binary WebSocket message — see
+	// runFrameRelayLoop/WriteBinary; relayed frames aren't a JSON
+	// envelope like everything else on this connection.
+	if err := hostConn.WriteMessage(websocket.BinaryMessage, []byte("fake-jpeg-bytes")); err != nil {
 		t.Fatalf("write relay frame: %v", err)
 	}
 

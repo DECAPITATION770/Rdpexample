@@ -19,7 +19,7 @@
   #control-view { display: flex; height: calc(100vh - 49px); }
   #screen-wrap { position: relative; flex: 1; display: flex; align-items: center; justify-content: center; background: #000; overflow: auto; }
   #screen { max-width: 100%; max-height: 100%; cursor: crosshair; }
-  #screen-http { max-width: 100%; max-height: 100%; cursor: crosshair; }
+  #screen-http { max-width: 100%; max-height: 100%; cursor: crosshair; -webkit-user-drag: none; user-select: none; }
   #toolbar { position: absolute; top: 10px; right: 10px; z-index: 5; display: flex; align-items: center; gap: 6px; }
   #toolbar button { font-size: 12px; opacity: 0.8; }
   #toolbar button:hover { opacity: 1; }
@@ -78,7 +78,7 @@
       <button id="expand-btn">⛶ Expand</button>
     </div>
     <canvas id="screen" width="800" height="600" tabindex="0"></canvas>
-    <img id="screen-http" hidden alt="live view (HTTP)">
+    <img id="screen-http" hidden alt="live view (HTTP)" draggable="false">
   </div>
   <div id="sidebar-hover-zone"></div>
   <div id="sidebar">
@@ -641,6 +641,15 @@ function wireMouseControl(el) {
     sendInput("mouse_up", {});
   });
   el.addEventListener("contextmenu", (e) => e.preventDefault());
+  // <img> is natively draggable in every browser — holding the mouse
+  // button down and moving starts a native "drag this image" gesture
+  // instead of a remote mouse-down-drag, fighting anything on the host
+  // that expects a held button (selection, window drag, sliders). The
+  // draggable="false" attribute on #screen-http covers most cases;
+  // this is a defense-in-depth backstop for browsers/situations where
+  // that alone isn't enough. Canvas isn't draggable by default, so this
+  // is a no-op there.
+  el.addEventListener("dragstart", (e) => e.preventDefault());
 }
 wireMouseControl(els.screen);
 wireMouseControl(els.screenHttp);
