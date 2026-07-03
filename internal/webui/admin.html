@@ -586,6 +586,7 @@ function wireMouseControl(el) {
     if (!els.mouseToggle.checked || !currentSession) return;
     const rect = el.getBoundingClientRect();
     const size = activeSurfaceSize();
+    if (size.width <= 0 || size.height <= 0) return;
     const x = Math.round(((e.clientX - rect.left) / rect.width) * size.width);
     const y = Math.round(((e.clientY - rect.top) / rect.height) * size.height);
     sendInput("mouse_move", { x, y });
