@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"net/http"
 
@@ -8,8 +9,11 @@ import (
 )
 
 func main() {
+	addr := flag.String("addr", ":9000", "address to listen on")
+	flag.Parse()
+
 	reg := signaling.NewRegistry()
 	handler := signaling.NewHandler(reg)
-	log.Println("rdp-server listening on :9000")
-	log.Fatal(http.ListenAndServe(":9000", handler))
+	log.Printf("rdp-server listening on %s", *addr)
+	log.Fatal(http.ListenAndServe(*addr, handler))
 }
