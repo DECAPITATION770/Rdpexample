@@ -3,6 +3,7 @@ package signaling
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"sync"
 
@@ -90,6 +91,7 @@ func (h *Handler) handleHost(w http.ResponseWriter, r *http.Request) {
 			if sessionID != "" {
 				h.reg.Unregister(sessionID)
 				h.removeHost(sessionID)
+				log.Printf("signaling: host session %s disconnected (%v)", sessionID, err)
 			}
 			return
 		}
@@ -101,10 +103,14 @@ func (h *Handler) handleHost(w http.ResponseWriter, r *http.Request) {
 			}
 			sessionID = h.reg.Register(reg.Name)
 			h.setHost(sessionID, conn)
+			log.Printf("signaling: host %q registered as session %s", reg.Name, sessionID)
 		case proto.MsgAnswer, proto.MsgICECandidate:
 			env.SessionID = sessionID
 			if viewer := h.viewerConn(sessionID); viewer != nil {
 				_ = viewer.WriteJSON(env)
+				log.Printf("signaling: relayed %s from host %s to viewer", env.Type, sessionID)
+			} else {
+				log.Printf("signaling: host %s sent %s but no viewer is attached to this session", sessionID, env.Type)
 			}
 		}
 	}
@@ -116,10 +122,12 @@ func (h *Handler) handleViewer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	log.Printf("signaling: viewer connected from %s", r.RemoteAddr)
 
 	for {
 		var env proto.Envelope
 		if err := conn.ReadJSON(&env); err != nil {
+			log.Printf("signaling: viewer %s disconnected (%v)", r.RemoteAddr, err)
 			return
 		}
 		switch env.Type {
@@ -127,10 +135,14 @@ func (h *Handler) handleViewer(w http.ResponseWriter, r *http.Request) {
 			list := proto.SessionList{Sessions: h.reg.List()}
 			payload, _ := json.Marshal(list)
 			_ = conn.WriteJSON(proto.Envelope{Type: proto.MsgSessionList, Payload: payload})
+			log.Printf("signaling: sent session list (%d sessions) to viewer %s", len(list.Sessions), r.RemoteAddr)
 		case proto.MsgOffer, proto.MsgICECandidate:
 			h.setViewer(env.SessionID, conn)
 			if host := h.hostConn(env.SessionID); host != nil {
 				_ = host.WriteJSON(env)
+				log.Printf("signaling: relayed %s from viewer to host session %s", env.Type, env.SessionID)
+			} else {
+				log.Printf("signaling: viewer sent %s for session %s but no host with that ID is connected (stale session list?)", env.Type, env.SessionID)
 			}
 		}
 	}
