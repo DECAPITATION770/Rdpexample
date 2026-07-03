@@ -29,7 +29,7 @@ Description=RDP-Tool signaling server + admin UI
 After=network.target
 
 [Service]
-ExecStart=/opt/rdp-tool/rdp-server -addr :9000 -ice-servers stun:127.0.0.1:3478,turn:127.0.0.1:3478 -turn-username rdp -turn-credential CHANGE_ME
+ExecStart=/opt/rdp-tool/rdp-server -addr :9000 -ice-servers stun:127.0.0.1:3478,turn:127.0.0.1:3478,turns:127.0.0.1:443?transport=tcp -turn-username rdp -turn-credential CHANGE_ME
 Restart=on-failure
 User=rdp-tool
 
@@ -59,7 +59,18 @@ fingerprint
 lt-cred-mech
 user=rdp:CHANGE_ME
 realm=your-domain.example
+tls-listening-port=443
+cert=/etc/letsencrypt/live/your-domain.example/fullchain.pem
+pkey=/etc/letsencrypt/live/your-domain.example/privkey.pem
 ```
+
+The `tls-listening-port` block adds a TURN-over-TLS/TCP relay on port 443.
+This matters because corporate and public-wifi firewalls that block UDP
+outright (blocking UDP/3478 along with it) almost always allow outbound
+TCP/443, since it's indistinguishable from ordinary HTTPS traffic. Without
+it, ICE has no fallback candidate on a UDP-blocked network — the Host and
+viewer never establish a relay path and the viewer gets a silent black
+screen with no indication of why.
 
 Enable it (Debian/Ubuntu ships coturn disabled by default):
 
@@ -69,7 +80,7 @@ sudo systemctl enable --now coturn
 sudo systemctl status coturn       # expect: active (running)
 ```
 
-Open the port on your firewall/security group: UDP+TCP 3478, plus coturn's relay range (default UDP 49152-65535) if you're behind a restrictive cloud firewall.
+Open the port on your firewall/security group: UDP+TCP 3478, plus coturn's relay range (default UDP 49152-65535) if you're behind a restrictive cloud firewall. Also open **TCP 443** to coturn for the TLS relay listener above — this is a separate requirement from the port 443 your web server (e.g. Caddy, step 4) already listens on, so if 443 is already bound by another process on this host, either give coturn a different public IP for its TLS listener or pick a different port (e.g. `tls-listening-port=5349`, the IANA-assigned TURNS port) and pass that port in the `turns:` URL below instead. The UDP/3478 path from this step remains the primary transport either way; TCP/443 (or whatever port you chose) is only a fallback for networks that block UDP.
 
 ## 4. Put TLS in front of rdp-server (recommended)
 
@@ -91,8 +102,10 @@ This gets you `https://your-domain.example/` for the admin UI and `wss://your-do
 ## 5. Point the Host at the deployed server
 
 ```powershell
-rdp-host.exe -name "MY-PC" -server wss://your-domain.example/ws/host -ice-servers stun:your-domain.example:3478,turn:your-domain.example:3478 -turn-username rdp -turn-credential CHANGE_ME
+rdp-host.exe -name "MY-PC" -server wss://your-domain.example/ws/host -ice-servers stun:your-domain.example:3478,turn:your-domain.example:3478,turns:your-domain.example:443?transport=tcp -turn-username rdp -turn-credential CHANGE_ME
 ```
+
+The `turns:...?transport=tcp` entry is the TCP/443 fallback from step 3 — pion (on the Host) and the browser (via `/config`, below) both receive the full comma-separated list and try every candidate, so this is additive: UDP/3478 is still tried first and used whenever it's reachable.
 
 The admin UI needs no separate configuration — it fetches its ICE server list from `https://your-domain.example/config`, which `rdp-server` already serves using the `-ice-servers`/`-turn-username`/`-turn-credential` flags from step 2.
 
@@ -103,3 +116,17 @@ systemctl status rdp-server coturn caddy    # all active (running)
 ```
 
 Then from a browser on a *different network* than the Host (e.g. phone on mobile data), open `https://your-domain.example/`, confirm the Host's session appears, click it, and confirm video/mouse/keyboard/overlay-message all work — this exercises the real NAT-traversal path that `localhost` testing can't.
+
+### Verifying the TURN-over-TCP/443 fallback
+
+There's no automated test for this — it's infra, and the whole point is
+exercising the codepath a normal LAN/UDP-friendly test never touches. To
+verify it manually: from a network that blocks outbound UDP (a locked-down
+corporate network, or a laptop with an outbound UDP firewall rule added
+temporarily), open `chrome://webrtc-internals` in a second tab, start a
+session against the Host, and watch the `PeerConnection` entry that
+appears. Confirm `iceConnectionState` reaches `connected` (not stuck at
+`checking` or `failed`) and that the selected candidate pair's local or
+remote candidate type is `relay` — that's the TURN/TCP/443 path doing the
+work, since a UDP-blocked network can never produce a `srflx` or `host`
+candidate pair.
