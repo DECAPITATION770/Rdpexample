@@ -298,6 +298,13 @@ func stopFrameRelay(sessionID string) {
 // time.Ticker already drops ticks that occur while its consumer is busy
 // — there is no separate unbounded send queue for this leg to overflow.
 func runFrameRelayLoop(conn *safeConn, cfg Config, bounds *screenBounds, sessionID string) {
+	// Idempotently stop any pre-existing loop for this session first, so a
+	// stray duplicate MsgStartFrameRelay (which shouldn't happen given the
+	// signaling server's first/last-subscriber tracking, but isn't
+	// guaranteed by anything in this file) can never orphan an old goroutine
+	// whose stop channel would otherwise be overwritten in the map below.
+	stopFrameRelay(sessionID)
+
 	stop := make(chan struct{})
 	frameRelayMu.Lock()
 	frameRelayStops[sessionID] = stop

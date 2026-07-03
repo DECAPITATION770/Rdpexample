@@ -389,6 +389,7 @@ function setStatus(text, cls) {
 // ---------- Transport switch (WebRTC <-> HTTP/MJPEG fallback) ----------
 
 let transportMode = "webrtc"; // "webrtc" | "http"
+let transportGeneration = 0;
 
 function activeSurfaceEl() {
   return transportMode === "http" ? els.screenHttp : els.screen;
@@ -467,6 +468,33 @@ els.shotBtn.addEventListener("click", () => {
   if (currentSession) signaling.requestScreenshot(currentSession.session_id);
 });
 
+// connectWebRTC (re)establishes the WebRTC PeerConnection for the current
+// session. It is shared by openSession and switchTransport("webrtc") to
+// avoid duplicating the fetchIceServers → RemoteSession → connect-timeout
+// sequence. Each call captures a generation token; if transportGeneration
+// or transportMode has moved on by the time the async ICE-server fetch
+// resolves (e.g. the user switched to HTTP mid-flight), this becomes a
+// no-op instead of clobbering the newer state with a stale connection.
+async function connectWebRTC() {
+  const myGeneration = ++transportGeneration;
+  gotFirstFrame = false;
+  setStatus("connecting…", "");
+  clearTimeout(connectTimeoutHandle);
+
+  const iceServers = await fetchIceServers();
+  if (myGeneration !== transportGeneration || transportMode !== "webrtc") return;
+
+  remote = new RemoteSession(signaling, currentSession, renderScreenFrame, iceServers);
+  remote.connect();
+  connectTimeoutHandle = setTimeout(() => {
+    if (myGeneration !== transportGeneration) return;
+    if (!gotFirstFrame) {
+      setStatus("⚠ WebRTC timed out — switching to HTTP", "failed");
+      switchTransport("http");
+    }
+  }, WEBRTC_CONNECT_TIMEOUT_MS);
+}
+
 async function openSession(session) {
   currentSession = session;
   transportMode = "webrtc";
@@ -477,19 +505,7 @@ async function openSession(session) {
   els.mouseToggle.checked = false;
   els.kbToggle.checked = false;
 
-  gotFirstFrame = false;
-  setStatus("connecting…", "");
-  clearTimeout(connectTimeoutHandle);
-  connectTimeoutHandle = setTimeout(() => {
-    if (!gotFirstFrame) {
-      setStatus("⚠ WebRTC timed out — switching to HTTP", "failed");
-      switchTransport("http");
-    }
-  }, WEBRTC_CONNECT_TIMEOUT_MS);
-
-  const iceServers = await fetchIceServers();
-  remote = new RemoteSession(signaling, session, renderScreenFrame, iceServers);
-  remote.connect();
+  await connectWebRTC();
 }
 
 // switchTransport tears down/creates the resources for the given
@@ -498,6 +514,7 @@ async function openSession(session) {
 // toggle button).
 function switchTransport(mode) {
   if (!currentSession) return;
+  transportGeneration++; // invalidate any in-flight connectWebRTC() from a previous call
   transportMode = mode;
   if (mode === "http") {
     if (remote) { remote.close(); remote = null; }
@@ -512,20 +529,7 @@ function switchTransport(mode) {
     els.screenHttp.hidden = true;
     els.screen.hidden = false;
     els.transportToggle.textContent = "⇄ HTTP";
-    gotFirstFrame = false;
-    setStatus("connecting…", "");
-    (async () => {
-      const iceServers = await fetchIceServers();
-      remote = new RemoteSession(signaling, currentSession, renderScreenFrame, iceServers);
-      remote.connect();
-      clearTimeout(connectTimeoutHandle);
-      connectTimeoutHandle = setTimeout(() => {
-        if (!gotFirstFrame) {
-          setStatus("⚠ WebRTC timed out — switching to HTTP", "failed");
-          switchTransport("http");
-        }
-      }, WEBRTC_CONNECT_TIMEOUT_MS);
-    })();
+    connectWebRTC();
   }
 }
 
@@ -534,6 +538,7 @@ els.transportToggle.addEventListener("click", () => {
 });
 
 els.back.addEventListener("click", () => {
+  transportGeneration++; // invalidate any in-flight connectWebRTC()
   clearTimeout(connectTimeoutHandle);
   if (remote) { remote.close(); remote = null; }
   currentSession = null;
