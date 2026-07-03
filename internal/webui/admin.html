@@ -16,12 +16,12 @@
   #sessions li .name { cursor: pointer; flex: 1; }
   #sessions li .name:hover { text-decoration: underline; }
   #sessions li.offline .name { opacity: 0.5; cursor: default; }
-  #sessions li .shot-btn { font-size: 12px; padding: 4px 8px; }
   #control-view { display: flex; height: calc(100vh - 49px); }
   #screen-wrap { position: relative; flex: 1; display: flex; align-items: center; justify-content: center; background: #000; overflow: auto; }
   #screen { max-width: 100%; max-height: 100%; cursor: crosshair; }
-  #expand-btn { position: absolute; top: 10px; right: 10px; z-index: 5; font-size: 12px; opacity: 0.8; }
-  #expand-btn:hover { opacity: 1; }
+  #toolbar { position: absolute; top: 10px; right: 10px; z-index: 5; display: flex; gap: 6px; }
+  #toolbar button { font-size: 12px; opacity: 0.8; }
+  #toolbar button:hover { opacity: 1; }
   #sidebar { width: 260px; padding: 16px; background: #262626; border-left: 1px solid #333; display: flex; flex-direction: column; gap: 16px; }
   /* Expanded mode: the video fills the whole control-view; the sidebar
      becomes a floating translucent overlay instead of a dedicated flex
@@ -59,7 +59,10 @@
 
 <div id="control-view" hidden>
   <div id="screen-wrap">
-    <button id="expand-btn">⛶ Expand</button>
+    <div id="toolbar">
+      <button id="shot-btn" title="Grab a one-off screenshot">📷</button>
+      <button id="expand-btn">⛶ Expand</button>
+    </div>
     <canvas id="screen" width="800" height="600" tabindex="0"></canvas>
   </div>
   <div id="sidebar">
@@ -333,6 +336,7 @@ const els = {
   msgFade: document.getElementById("msg-fade"),
   msgSend: document.getElementById("msg-send"),
   expandBtn: document.getElementById("expand-btn"),
+  shotBtn: document.getElementById("shot-btn"),
   screenshotModal: document.getElementById("screenshot-modal"),
   screenshotImg: document.getElementById("screenshot-img"),
   screenshotClose: document.getElementById("screenshot-close"),
@@ -343,6 +347,7 @@ let mouseCombo = loadCombo("rdp.mouseCombo", { ctrl: true, alt: true, shift: fal
 let kbCombo = loadCombo("rdp.kbCombo", { ctrl: true, alt: true, shift: false, code: "KeyK" });
 let rebinding = null; // "mouse" | "keyboard" | null
 let remote = null; // active RemoteSession
+let currentSession = null; // session_id of the currently open session, if any
 
 function updateHotkeyLabels() {
   els.mouseHotkey.textContent = mouseCombo ? comboLabel(mouseCombo) : "";
@@ -367,14 +372,6 @@ function renderSessions() {
     name.textContent = (s.online ? "\u{1F7E2} " : "⚪ ") + s.name;
     if (s.online) name.addEventListener("click", () => openSession(s));
     li.appendChild(name);
-
-    if (s.online) {
-      const shotBtn = document.createElement("button");
-      shotBtn.className = "shot-btn";
-      shotBtn.textContent = "Screenshot";
-      shotBtn.addEventListener("click", () => signaling.requestScreenshot(s.session_id));
-      li.appendChild(shotBtn);
-    }
 
     els.sessions.appendChild(li);
   }
@@ -402,7 +399,12 @@ els.expandBtn.addEventListener("click", () => {
 els.refresh.addEventListener("click", () => signaling.requestSessionList());
 signaling.ws.addEventListener("open", () => signaling.requestSessionList());
 
+els.shotBtn.addEventListener("click", () => {
+  if (currentSession) signaling.requestScreenshot(currentSession.session_id);
+});
+
 async function openSession(session) {
+  currentSession = session;
   els.headerTitle.textContent = session.name;
   els.back.hidden = false;
   els.listView.hidden = true;
