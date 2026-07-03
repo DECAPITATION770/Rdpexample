@@ -132,6 +132,12 @@ func handleOffer(signaling *websocket.Conn, cfg Config, env proto.Envelope) {
 	runCaptureLoop(peer, cfg)
 }
 
+// screenFrameChunkSize keeps each DataChannel message well under every
+// WebRTC implementation's message-size limit we know of. A real desktop
+// capture routinely exceeds 256KB as a single JPEG, which is why frames
+// are always split — see internal/proto.EncodeScreenFrameChunks.
+const screenFrameChunkSize = 16 * 1024
+
 func runCaptureLoop(peer *webrtcconn.Peer, cfg Config) {
 	defer peer.Close()
 
@@ -146,20 +152,24 @@ func runCaptureLoop(peer *webrtcconn.Peer, cfg Config) {
 			continue
 		}
 		seq++
-		frame, err := proto.EncodeFrame(proto.ScreenFrame{JPEG: jpegBytes, Seq: seq})
-		if err != nil {
-			log.Printf("hostapp: encode frame failed: %v", err)
-			continue
-		}
-		if err := peer.Send(frame); err != nil {
-			// A closed/broken data channel means the viewer disconnected;
-			// stop this session's capture loop rather than spinning on
-			// send errors forever.
-			if strings.Contains(err.Error(), "not established") || isClosedErr(err) {
-				log.Printf("hostapp: viewer disconnected, stopping capture loop")
-				return
+
+		disconnected := false
+		for _, chunk := range proto.EncodeScreenFrameChunks(seq, jpegBytes, screenFrameChunkSize) {
+			if err := peer.Send(chunk); err != nil {
+				// A closed/broken data channel means the viewer
+				// disconnected; stop this session's capture loop rather
+				// than spinning on send errors forever.
+				if strings.Contains(err.Error(), "not established") || isClosedErr(err) {
+					log.Printf("hostapp: viewer disconnected, stopping capture loop")
+					disconnected = true
+					break
+				}
+				log.Printf("hostapp: send frame chunk failed: %v", err)
+				break
 			}
-			log.Printf("hostapp: send frame failed: %v", err)
+		}
+		if disconnected {
+			return
 		}
 	}
 }

@@ -80,7 +80,6 @@
 
 const FRAME_INPUT_EVENT = 1;
 const FRAME_OVERLAY_MESSAGE = 2;
-const FRAME_SCREEN_FRAME = 3;
 
 function encodeFrame(kind, obj) {
   const json = new TextEncoder().encode(JSON.stringify(obj));
@@ -91,12 +90,56 @@ function encodeFrame(kind, obj) {
   return buf;
 }
 
-function decodeFrame(buf) {
+// Screen frames don't use the framing above — the host JPEG-encodes its
+// capture and splits it into fixed-size chunks (internal/proto's
+// EncodeScreenFrameChunks), because a real desktop capture routinely
+// exceeds a single WebRTC DataChannel message's size limit (commonly
+// ~256KB) even at moderate JPEG quality. Byte 0 being SCREEN_CHUNK_MARKER
+// (0xFE) distinguishes a chunk from the [kind][length][JSON] framing
+// above, whose kind bytes are always small (1, 2, ...).
+const SCREEN_CHUNK_MARKER = 0xFE;
+const SCREEN_CHUNK_HEADER_SIZE = 9; // [marker(1)][seq(4)][index(2)][total(2)]
+
+function parseScreenFrameChunk(buf) {
+  if (buf.byteLength < SCREEN_CHUNK_HEADER_SIZE) return null;
   const view = new DataView(buf);
-  const kind = view.getUint8(0);
-  const length = view.getUint32(1, false);
-  const jsonBytes = new Uint8Array(buf, 5, length);
-  return { kind, obj: JSON.parse(new TextDecoder().decode(jsonBytes)) };
+  if (view.getUint8(0) !== SCREEN_CHUNK_MARKER) return null;
+  return {
+    seq: view.getUint32(1, false),
+    index: view.getUint16(5, false),
+    total: view.getUint16(7, false),
+    payload: new Uint8Array(buf, SCREEN_CHUNK_HEADER_SIZE),
+  };
+}
+
+// Mirrors internal/proto.ScreenFrameReassembler.
+class ScreenFrameReassembler {
+  constructor() {
+    this.seq = null;
+    this.total = 0;
+    this.got = 0;
+    this.parts = [];
+  }
+
+  add(seq, index, total, payload) {
+    if (this.seq !== seq) {
+      this.seq = seq;
+      this.total = total;
+      this.parts = new Array(total);
+      this.got = 0;
+    }
+    if (index >= this.parts.length || this.parts[index]) return null; // out-of-range or duplicate
+    this.parts[index] = payload;
+    this.got++;
+    if (this.got < this.total) return null;
+
+    let size = 0;
+    for (const p of this.parts) size += p.length;
+    const out = new Uint8Array(size);
+    let offset = 0;
+    for (const p of this.parts) { out.set(p, offset); offset += p.length; }
+    return out;
+  }
 }
 
 // JS KeyboardEvent.code -> Windows virtual-key code, for internal/input's
@@ -160,14 +203,20 @@ function fetchIceServers() {
 // ---------- RemoteSession: one WebRTC PeerConnection to a host ----------
 
 class RemoteSession {
-  constructor(signaling, session, onFrame, iceServers) {
+  constructor(signaling, session, onScreenFrame, iceServers) {
     this.signaling = signaling;
     this.session = session;
-    this.onFrame = onFrame;
+    this.onScreenFrame = onScreenFrame;
+    this.reassembler = new ScreenFrameReassembler();
     this.pc = new RTCPeerConnection({ iceServers: iceServers || [] });
     this.dc = this.pc.createDataChannel("control");
     this.dc.binaryType = "arraybuffer";
-    this.dc.onmessage = (ev) => this.onFrame(decodeFrame(ev.data));
+    this.dc.onmessage = (ev) => {
+      const chunk = parseScreenFrameChunk(ev.data);
+      if (!chunk) return; // host never sends anything else over this channel
+      const complete = this.reassembler.add(chunk.seq, chunk.index, chunk.total, chunk.payload);
+      if (complete) this.onScreenFrame(complete);
+    };
   }
 
   async connect() {
@@ -286,9 +335,7 @@ async function openSession(session) {
   els.kbToggle.checked = false;
 
   const iceServers = await fetchIceServers();
-  remote = new RemoteSession(signaling, session, ({ kind, obj }) => {
-    if (kind === FRAME_SCREEN_FRAME) renderScreenFrame(obj);
-  }, iceServers);
+  remote = new RemoteSession(signaling, session, renderScreenFrame, iceServers);
   remote.connect();
 }
 
@@ -300,7 +347,11 @@ els.back.addEventListener("click", () => {
   els.headerTitle.textContent = "RDP-Tool — Sessions";
 });
 
-function renderScreenFrame(frame) {
+// renderScreenFrame takes the raw reassembled JPEG bytes (a Uint8Array,
+// not base64 — chunking sends the bytes directly, no JSON/base64
+// overhead) and draws them onto the canvas.
+function renderScreenFrame(jpegBytes) {
+  const url = URL.createObjectURL(new Blob([jpegBytes], { type: "image/jpeg" }));
   const img = new Image();
   img.onload = () => {
     if (els.screen.width !== img.width || els.screen.height !== img.height) {
@@ -308,8 +359,10 @@ function renderScreenFrame(frame) {
       els.screen.height = img.height;
     }
     els.screen.getContext("2d").drawImage(img, 0, 0);
+    URL.revokeObjectURL(url);
   };
-  img.src = "data:image/jpeg;base64," + frame.jpeg;
+  img.onerror = () => URL.revokeObjectURL(url);
+  img.src = url;
 }
 
 // ---------- Mouse control ----------

@@ -60,7 +60,6 @@ type FrameKind uint8
 const (
 	FrameKindInputEvent FrameKind = iota + 1
 	FrameKindOverlayMessage
-	FrameKindScreenFrame
 )
 
 type InputEventKind string
@@ -104,12 +103,13 @@ func (o *OverlayMessage) Normalize() {
 	o.FadeSeconds = math.Round(o.FadeSeconds*10) / 10
 }
 
-type ScreenFrame struct {
-	JPEG []byte `json:"jpeg"`
-	Seq  uint32 `json:"seq"`
-}
-
 // --- Framing: [1 byte kind][4 byte big-endian length][JSON payload] ---
+//
+// Screen frames do NOT use this framing — they're JPEG bytes, often
+// larger than a single WebRTC DataChannel message can carry, so they go
+// through EncodeScreenFrameChunks/ScreenFrameReassembler instead (see
+// screenframe.go). A receiver tells the two apart by checking byte 0
+// against chunkMarker before assuming this JSON framing applies.
 
 func EncodeFrame(v any) ([]byte, error) {
 	var kind FrameKind
@@ -118,8 +118,6 @@ func EncodeFrame(v any) ([]byte, error) {
 		kind = FrameKindInputEvent
 	case OverlayMessage:
 		kind = FrameKindOverlayMessage
-	case ScreenFrame:
-		kind = FrameKindScreenFrame
 	default:
 		return nil, fmt.Errorf("proto: unsupported frame type %T", v)
 	}
@@ -156,12 +154,6 @@ func DecodeFrame(data []byte) (any, error) {
 		return v, nil
 	case FrameKindOverlayMessage:
 		var v OverlayMessage
-		if err := json.Unmarshal(payload, &v); err != nil {
-			return nil, err
-		}
-		return v, nil
-	case FrameKindScreenFrame:
-		var v ScreenFrame
 		if err := json.Unmarshal(payload, &v); err != nil {
 			return nil, err
 		}
