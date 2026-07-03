@@ -195,6 +195,13 @@ func handleOffer(signaling *safeConn, cfg Config, env proto.Envelope) {
 // are always split — see internal/proto.EncodeScreenFrameChunks.
 const screenFrameChunkSize = 16 * 1024
 
+// videoBufferedAmountThreshold caps how much unacknowledged video data we
+// let pion's DataChannel queue before we start skipping frames instead of
+// adding to the backlog. ~4 chunks' worth is enough slack for a brief
+// stall without ever letting the picture drift meaningfully behind
+// real time.
+const videoBufferedAmountThreshold = 4 * screenFrameChunkSize
+
 func runCaptureLoop(peer *webrtcconn.Peer, cfg Config, bounds *screenBounds) {
 	defer peer.Close()
 
@@ -202,7 +209,20 @@ func runCaptureLoop(peer *webrtcconn.Peer, cfg Config, bounds *screenBounds) {
 	defer ticker.Stop()
 
 	var seq uint32
+	wasDropping := false
 	for range ticker.C {
+		if buffered := peer.VideoBufferedAmount(); buffered > videoBufferedAmountThreshold {
+			if !wasDropping {
+				log.Printf("hostapp: video channel congested (buffered=%d bytes), dropping frames until it drains", buffered)
+				wasDropping = true
+			}
+			continue
+		}
+		if wasDropping {
+			log.Printf("hostapp: video channel drained, resuming frame sends")
+			wasDropping = false
+		}
+
 		jpegBytes, width, height, err := capture.GrabPrimaryJPEG(cfg.JPEGQuality)
 		if err != nil {
 			log.Printf("hostapp: capture failed: %v", err)
