@@ -34,12 +34,24 @@ var (
 // window — but that also means log.Printf output has nowhere visible to
 // go by default. Writing to a file next to the exe keeps it inspectable
 // without requiring a console.
+//
+// If that location isn't writable — rdp-host.exe run from Program
+// Files, a locked-down folder, or a read-only mount, all of which deny
+// a normal user write access — falls back to the OS temp directory,
+// which is always writable for the current user session. Silently
+// giving up here (the previous behavior) meant a permission error left
+// nothing logged anywhere and nothing visible to say why.
 func openLogFile() (*os.File, error) {
-	exePath, err := os.Executable()
-	if err != nil {
-		return nil, err
+	const logName = "rdp-host.log"
+
+	if exePath, err := os.Executable(); err == nil {
+		logPath := filepath.Join(filepath.Dir(exePath), logName)
+		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+			return f, nil
+		}
 	}
-	logPath := filepath.Join(filepath.Dir(exePath), "rdp-host.log")
+
+	logPath := filepath.Join(os.TempDir(), logName)
 	return os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 }
 
