@@ -49,6 +49,11 @@
   #msg-fade { width: 70px; padding: 6px; background: #1e1e1e; color: #eee; border: 1px solid #444; border-radius: 4px; }
   #msg-color { width: 32px; height: 28px; padding: 2px; background: #1e1e1e; border: 1px solid #444; border-radius: 4px; cursor: pointer; }
   .row { display: flex; align-items: center; gap: 8px; }
+  .slider-row { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+  .slider-row label { font-size: 12px; color: #bbb; width: 62px; flex-shrink: 0; }
+  .slider-row input[type=range] { flex: 1; min-width: 0; accent-color: #4a9eff; }
+  .slider-row .val { font-size: 12px; color: #eee; width: 46px; text-align: right; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+  #quality-res { flex: 1; min-width: 0; padding: 5px; background: #1e1e1e; color: #eee; border: 1px solid #444; border-radius: 4px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -105,6 +110,30 @@
         <input id="msg-fade" type="number" step="0.1" min="0.1" value="2.0">
         <button id="msg-send" class="primary">Send</button>
       </div>
+    </div>
+    <div class="toggle-row">
+      <div>Quality (live)</div>
+      <div class="slider-row">
+        <label for="q-fps">FPS</label>
+        <input id="q-fps" type="range" min="1" max="60" value="30">
+        <span class="val" id="q-fps-val">30</span>
+      </div>
+      <div class="slider-row">
+        <label for="q-quality">Quality</label>
+        <input id="q-quality" type="range" min="10" max="100" value="75">
+        <span class="val" id="q-quality-val">75</span>
+      </div>
+      <div class="slider-row">
+        <label for="quality-res">Resolution</label>
+        <select id="quality-res">
+          <option value="0">Native</option>
+          <option value="1920">1920px</option>
+          <option value="1280">1280px</option>
+          <option value="960">960px</option>
+          <option value="640">640px</option>
+        </select>
+      </div>
+      <div class="hint">Applies instantly to the running host, no restart.</div>
     </div>
     <div class="hint">Both toggles start OFF. Click Rebind then press a new key combo to change a hotkey.</div>
   </div>
@@ -287,6 +316,14 @@ class SignalingClient {
   sendOverlayMessage(sessionId, msg) {
     this._send({ type: "overlay_message", session_id: sessionId, payload: msg });
   }
+
+  // sendSettings pushes live stream-tuning values (fps / quality /
+  // downscale width) to the host, which applies them mid-stream. Omitted
+  // fields are left unchanged host-side; here we always send all three
+  // since the UI holds the full current state.
+  sendSettings(sessionId, settings) {
+    this._send({ type: "set_settings", session_id: sessionId, payload: settings });
+  }
 }
 
 // ---------- ICE server config, fetched once from the server ----------
@@ -430,6 +467,11 @@ const els = {
   msgColor: document.getElementById("msg-color"),
   msgFade: document.getElementById("msg-fade"),
   msgSend: document.getElementById("msg-send"),
+  qFps: document.getElementById("q-fps"),
+  qFpsVal: document.getElementById("q-fps-val"),
+  qQuality: document.getElementById("q-quality"),
+  qQualityVal: document.getElementById("q-quality-val"),
+  qualityRes: document.getElementById("quality-res"),
   expandBtn: document.getElementById("expand-btn"),
   sidebar: document.getElementById("sidebar"),
   sidebarHoverZone: document.getElementById("sidebar-hover-zone"),
@@ -838,6 +880,31 @@ els.msgSend.addEventListener("click", () => {
   }
   els.msgText.value = "";
 });
+
+// ---------- Live quality controls ----------
+
+// pushSettings sends the current slider/select values to the host, which
+// applies them mid-stream (no reconnect, no restart). Always sends all
+// three fields since the UI holds the complete state. Settings are relayed
+// over the signaling WebSocket, which exists in both transports, so this
+// works whether the live view is WebRTC or the HTTP fallback.
+function pushSettings() {
+  if (!currentSession) return;
+  signaling.sendSettings(currentSession.session_id, {
+    fps: parseInt(els.qFps.value, 10),
+    quality: parseInt(els.qQuality.value, 10),
+    max_width: parseInt(els.qualityRes.value, 10),
+  });
+}
+
+// The range inputs update their number readout continuously as you drag
+// ("input"), but only push to the host when you let go ("change") — so a
+// drag across the track doesn't fire dozens of settings messages mid-slide.
+els.qFps.addEventListener("input", () => { els.qFpsVal.textContent = els.qFps.value; });
+els.qQuality.addEventListener("input", () => { els.qQualityVal.textContent = els.qQuality.value; });
+els.qFps.addEventListener("change", pushSettings);
+els.qQuality.addEventListener("change", pushSettings);
+els.qualityRes.addEventListener("change", pushSettings);
 </script>
 </body>
 </html>

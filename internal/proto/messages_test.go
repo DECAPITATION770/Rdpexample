@@ -58,3 +58,38 @@ func TestOverlayMessage_RoundsFadeToOneDecimal(t *testing.T) {
 		t.Fatalf("FadeSeconds = %v, want 2.3", msg.FadeSeconds)
 	}
 }
+
+func intp(v int) *int { return &v }
+
+func TestSettings_Clamp(t *testing.T) {
+	cases := []struct {
+		name              string
+		in                Settings
+		wantFPS, wantQ    *int
+		wantMaxW          *int
+	}{
+		{"nil fields stay nil", Settings{}, nil, nil, nil},
+		{"in-range untouched", Settings{FPS: intp(30), Quality: intp(75), MaxWidth: intp(1280)}, intp(30), intp(75), intp(1280)},
+		{"fps floored", Settings{FPS: intp(0)}, intp(1), nil, nil},
+		{"fps capped", Settings{FPS: intp(999)}, intp(60), nil, nil},
+		{"quality floored", Settings{Quality: intp(1)}, nil, intp(10), nil},
+		{"quality capped", Settings{Quality: intp(500)}, nil, intp(100), nil},
+		{"maxwidth 0 stays native", Settings{MaxWidth: intp(0)}, nil, nil, intp(0)},
+		{"maxwidth floored", Settings{MaxWidth: intp(50)}, nil, nil, intp(320)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := c.in
+			s.Clamp()
+			eq := func(got, want *int) bool {
+				if got == nil || want == nil {
+					return got == nil && want == nil
+				}
+				return *got == *want
+			}
+			if !eq(s.FPS, c.wantFPS) || !eq(s.Quality, c.wantQ) || !eq(s.MaxWidth, c.wantMaxW) {
+				t.Errorf("Clamp() = {FPS:%v Quality:%v MaxWidth:%v}", s.FPS, s.Quality, s.MaxWidth)
+			}
+		})
+	}
+}

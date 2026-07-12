@@ -25,6 +25,7 @@ const (
 	MsgScreenshot        MsgType = "screenshot"
 	MsgInputEvent        MsgType = "input_event"       // viewer -> host, relayed: proto.InputEvent payload
 	MsgOverlayMessage    MsgType = "overlay_message"   // viewer -> host, relayed: proto.OverlayMessage payload
+	MsgSetSettings       MsgType = "set_settings"      // viewer -> host, relayed: proto.Settings payload (live quality/fps/downscale)
 	MsgStartFrameRelay   MsgType = "start_frame_relay" // server -> host: begin pushing binary frames (see below)
 	MsgStopFrameRelay    MsgType = "stop_frame_relay"  // server -> host: stop pushing them
 	// Relayed JPEG frames (host -> server, for the HTTP/MJPEG fallback's
@@ -102,6 +103,52 @@ type InputEvent struct {
 	Button uint8          `json:"button,omitempty"`
 	Delta  int32          `json:"delta,omitempty"`
 	KeyVK  uint16         `json:"key_vk,omitempty"`
+}
+
+// Settings lets the viewer tune the live stream on the fly, without
+// relaunching the host: frame rate, JPEG quality, and an optional
+// downscale width. It's relayed viewer -> host over the signaling
+// WebSocket (MsgSetSettings), so it applies in both the WebRTC and
+// HTTP-fallback transports, which share the host's capture loops.
+//
+// Each field is a pointer so "leave this one as it is" (nil) is
+// distinguishable from "set it to zero": a nil FPS means don't touch the
+// current rate, whereas MaxWidth == 0 is a real value meaning "native
+// resolution, no downscale." Clamp() bounds whatever is provided to sane
+// ranges before the host applies it.
+type Settings struct {
+	FPS      *int `json:"fps,omitempty"`
+	Quality  *int `json:"quality,omitempty"`
+	MaxWidth *int `json:"max_width,omitempty"`
+}
+
+// Clamp bounds each provided field to a range the host can safely honor,
+// mutating in place. Nil fields are left nil (unchanged). This runs on
+// the host so a malformed or hostile viewer message can't push the
+// capture loop into a nonsensical state (0fps busy-loop, 4000-quality, a
+// 5px-wide downscale).
+func (s *Settings) Clamp() {
+	if s.FPS != nil {
+		*s.FPS = clampInt(*s.FPS, 1, 60)
+	}
+	if s.Quality != nil {
+		*s.Quality = clampInt(*s.Quality, 10, 100)
+	}
+	if s.MaxWidth != nil && *s.MaxWidth != 0 {
+		// 0 stays 0 (native). Any other value is a real target width,
+		// floored so a downscale can never collapse the image.
+		*s.MaxWidth = clampInt(*s.MaxWidth, 320, 7680)
+	}
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 type OverlayMessage struct {

@@ -88,6 +88,45 @@ func (c Config) iceServers() []webrtc.ICEServer {
 	return []webrtc.ICEServer{{URLs: c.ICEServers, Username: c.ICEUsername, Credential: c.ICECredential}}
 }
 
+// liveSettings holds the stream-tuning knobs a viewer can change on the
+// fly (via MsgSetSettings). One instance is shared by reference across
+// every capture loop the host runs, so a change takes effect immediately
+// on whatever is currently streaming — in both the WebRTC and HTTP paths.
+// Access is atomic because the signaling read goroutine writes these
+// while the capture goroutines read them once per frame.
+type liveSettings struct {
+	quality    atomic.Int32 // JPEG quality 1-100
+	maxWidth   atomic.Int32 // downscale target width in px; 0 = native
+	frameNanos atomic.Int64 // between-frame delay in nanoseconds
+}
+
+func newLiveSettings(cfg Config) *liveSettings {
+	s := &liveSettings{}
+	s.quality.Store(int32(cfg.JPEGQuality))
+	s.maxWidth.Store(int32(cfg.MaxWidth))
+	s.frameNanos.Store(int64(cfg.FrameDelay))
+	return s
+}
+
+func (s *liveSettings) frameDelay() time.Duration { return time.Duration(s.frameNanos.Load()) }
+
+// apply folds a relayed Settings message into the live values, leaving
+// any nil (unspecified) field untouched. It clamps first, on the host
+// side, so a malformed or hostile viewer message can't wedge a capture
+// loop (0fps busy-spin, absurd quality, a degenerate downscale).
+func (s *liveSettings) apply(msg proto.Settings) {
+	msg.Clamp()
+	if msg.Quality != nil {
+		s.quality.Store(int32(*msg.Quality))
+	}
+	if msg.MaxWidth != nil {
+		s.maxWidth.Store(int32(*msg.MaxWidth))
+	}
+	if msg.FPS != nil && *msg.FPS > 0 {
+		s.frameNanos.Store(int64(time.Second) / int64(*msg.FPS))
+	}
+}
+
 // reconnectDelay is how long Run waits before retrying after the
 // signaling connection fails to establish or drops. A single machine
 // running this unattended shouldn't ever need a human to notice a
@@ -110,9 +149,10 @@ func Run(cfg Config) error {
 	cfg.applyDefaults()
 
 	bounds := &screenBounds{}
+	settings := newLiveSettings(cfg)
 
 	for {
-		if err := connectAndServe(cfg, bounds); err != nil {
+		if err := connectAndServe(cfg, bounds, settings); err != nil {
 			log.Printf("hostapp: connection error: %v — reconnecting in %s", err, reconnectDelay)
 		}
 		time.Sleep(reconnectDelay)
@@ -122,7 +162,7 @@ func Run(cfg Config) error {
 // connectAndServe dials the signaling server once, registers as a host,
 // and serves incoming messages until the connection fails or drops. Its
 // error return is what tells Run's retry loop to try again.
-func connectAndServe(cfg Config, bounds *screenBounds) error {
+func connectAndServe(cfg Config, bounds *screenBounds, settings *liveSettings) error {
 	rawConn, _, err := websocket.DefaultDialer.Dial(cfg.SignalingURL, nil)
 	if err != nil {
 		return err
@@ -144,7 +184,7 @@ func connectAndServe(cfg Config, bounds *screenBounds) error {
 
 		switch env.Type {
 		case proto.MsgOffer:
-			go handleOffer(conn, cfg, env, bounds)
+			go handleOffer(conn, cfg, env, bounds, settings)
 		case proto.MsgRequestScreenshot:
 			go handleScreenshotRequest(conn, env)
 		case proto.MsgInputEvent:
@@ -161,8 +201,17 @@ func connectAndServe(cfg Config, bounds *screenBounds) error {
 				continue
 			}
 			showOverlayMessage(msg)
+		case proto.MsgSetSettings:
+			var msg proto.Settings
+			if err := json.Unmarshal(env.Payload, &msg); err != nil {
+				log.Printf("hostapp: bad relayed settings: %v", err)
+				continue
+			}
+			settings.apply(msg)
+			log.Printf("hostapp: applied live settings: quality=%d maxWidth=%d frameDelay=%s",
+				settings.quality.Load(), settings.maxWidth.Load(), settings.frameDelay())
 		case proto.MsgStartFrameRelay:
-			go runFrameRelayLoop(conn, cfg, bounds, env.SessionID)
+			go runFrameRelayLoop(conn, settings, bounds, env.SessionID)
 		case proto.MsgStopFrameRelay:
 			stopFrameRelay(env.SessionID)
 		default:
@@ -206,7 +255,7 @@ type screenBounds struct {
 	height atomic.Int32
 }
 
-func handleOffer(signaling *safeConn, cfg Config, env proto.Envelope, bounds *screenBounds) {
+func handleOffer(signaling *safeConn, cfg Config, env proto.Envelope, bounds *screenBounds, settings *liveSettings) {
 	var sdpMsg proto.SDPMessage
 	if err := json.Unmarshal(env.Payload, &sdpMsg); err != nil {
 		log.Printf("hostapp: bad offer payload for session %s: %v", env.SessionID, err)
@@ -245,7 +294,7 @@ func handleOffer(signaling *safeConn, cfg Config, env proto.Envelope, bounds *sc
 
 	peer.OnData(func(data []byte) { handleDataChannelMessage(data, bounds) })
 
-	runCaptureLoop(peer, cfg, bounds)
+	runCaptureLoop(peer, settings, bounds)
 }
 
 // screenFrameChunkSize keeps each DataChannel message well under every
@@ -261,16 +310,23 @@ const screenFrameChunkSize = 16 * 1024
 // real time.
 const videoBufferedAmountThreshold = 4 * screenFrameChunkSize
 
-func runCaptureLoop(peer *webrtcconn.Peer, cfg Config, bounds *screenBounds) {
+func runCaptureLoop(peer *webrtcconn.Peer, settings *liveSettings, bounds *screenBounds) {
 	defer peer.Close()
 
-	ticker := time.NewTicker(cfg.FrameDelay)
+	curDelay := settings.frameDelay()
+	ticker := time.NewTicker(curDelay)
 	defer ticker.Stop()
 
 	var seq uint32
 	lastHash := capture.ForceEncode // force the first frame out regardless of screen content
 	wasDropping := false
 	for range ticker.C {
+		// Pick up any live setting changes since the last frame; a new
+		// frame rate means retiming the ticker.
+		if d := settings.frameDelay(); d != curDelay {
+			curDelay = d
+			ticker.Reset(curDelay)
+		}
 		if buffered := peer.VideoBufferedAmount(); buffered > videoBufferedAmountThreshold {
 			if !wasDropping {
 				log.Printf("hostapp: video channel congested (buffered=%d bytes), dropping frames until it drains", buffered)
@@ -283,7 +339,7 @@ func runCaptureLoop(peer *webrtcconn.Peer, cfg Config, bounds *screenBounds) {
 			wasDropping = false
 		}
 
-		jpegBytes, width, height, hash, err := capture.GrabPrimaryFrame(cfg.JPEGQuality, cfg.MaxWidth, lastHash)
+		jpegBytes, width, height, hash, err := capture.GrabPrimaryFrame(int(settings.quality.Load()), int(settings.maxWidth.Load()), lastHash)
 		if err != nil {
 			log.Printf("hostapp: capture failed: %v", err)
 			continue
@@ -342,7 +398,7 @@ func stopFrameRelay(sessionID string) {
 // socket, so if the signaling link is backed up the write blocks, and
 // time.Ticker already drops ticks that occur while its consumer is busy
 // — there is no separate unbounded send queue for this leg to overflow.
-func runFrameRelayLoop(conn *safeConn, cfg Config, bounds *screenBounds, sessionID string) {
+func runFrameRelayLoop(conn *safeConn, settings *liveSettings, bounds *screenBounds, sessionID string) {
 	// Idempotently stop any pre-existing loop for this session first, so a
 	// stray duplicate MsgStartFrameRelay (which shouldn't happen given the
 	// signaling server's first/last-subscriber tracking, but isn't
@@ -356,7 +412,8 @@ func runFrameRelayLoop(conn *safeConn, cfg Config, bounds *screenBounds, session
 	frameRelayMu.Unlock()
 	defer stopFrameRelay(sessionID)
 
-	ticker := time.NewTicker(cfg.FrameDelay)
+	curDelay := settings.frameDelay()
+	ticker := time.NewTicker(curDelay)
 	defer ticker.Stop()
 
 	lastHash := capture.ForceEncode // force the first frame out regardless of screen content
@@ -367,7 +424,13 @@ func runFrameRelayLoop(conn *safeConn, cfg Config, bounds *screenBounds, session
 			log.Printf("hostapp: stopping HTTP frame relay for session %s", sessionID)
 			return
 		case <-ticker.C:
-			jpegBytes, width, height, hash, err := capture.GrabPrimaryFrame(cfg.JPEGQuality, cfg.MaxWidth, lastHash)
+			// Pick up any live setting changes; a new frame rate retimes
+			// the ticker.
+			if d := settings.frameDelay(); d != curDelay {
+				curDelay = d
+				ticker.Reset(curDelay)
+			}
+			jpegBytes, width, height, hash, err := capture.GrabPrimaryFrame(int(settings.quality.Load()), int(settings.maxWidth.Load()), lastHash)
 			if err != nil {
 				log.Printf("hostapp: relay capture failed: %v", err)
 				continue
