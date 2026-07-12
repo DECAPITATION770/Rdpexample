@@ -7,6 +7,7 @@ require (
 	github.com/jezek/xgb v1.1.1
 	github.com/kbinani/screenshot v0.0.0-20250624051815-089614a94018
 	github.com/pion/webrtc/v4 v4.2.16
+	golang.org/x/image v0.44.0
 	golang.org/x/sys v0.41.0
 )
 

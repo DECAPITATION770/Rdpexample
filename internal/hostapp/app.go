@@ -63,16 +63,21 @@ type Config struct {
 	ICEServers    []string      // STUN/TURN URLs, e.g. "stun:vps:3478"; empty is fine on a LAN/loopback
 	ICEUsername   string        // TURN username; ignored by STUN entries
 	ICECredential string        // TURN credential; ignored by STUN entries
-	JPEGQuality   int           // 1-100; 0 defaults to 70
-	FrameDelay    time.Duration // 0 defaults to 100ms (~10fps)
+	JPEGQuality   int           // 1-100; 0 defaults to 75
+	FrameDelay    time.Duration // between-frame target; 0 defaults to ~30fps
+	MaxWidth      int           // downscale captures to at most this width; 0 = native resolution
 }
 
 func (c *Config) applyDefaults() {
 	if c.JPEGQuality <= 0 {
-		c.JPEGQuality = 70
+		c.JPEGQuality = 75
 	}
 	if c.FrameDelay <= 0 {
-		c.FrameDelay = 100 * time.Millisecond
+		// ~30fps. The old default was 100ms (10fps), a hard ceiling that
+		// made even a fast machine feel sluggish regardless of transport;
+		// frame-skip on static screens (see the capture loops) keeps the
+		// higher rate from wasting CPU when nothing is moving.
+		c.FrameDelay = 33 * time.Millisecond
 	}
 }
 
@@ -263,6 +268,7 @@ func runCaptureLoop(peer *webrtcconn.Peer, cfg Config, bounds *screenBounds) {
 	defer ticker.Stop()
 
 	var seq uint32
+	lastHash := capture.ForceEncode // force the first frame out regardless of screen content
 	wasDropping := false
 	for range ticker.C {
 		if buffered := peer.VideoBufferedAmount(); buffered > videoBufferedAmountThreshold {
@@ -277,10 +283,14 @@ func runCaptureLoop(peer *webrtcconn.Peer, cfg Config, bounds *screenBounds) {
 			wasDropping = false
 		}
 
-		jpegBytes, width, height, err := capture.GrabPrimaryJPEG(cfg.JPEGQuality)
+		jpegBytes, width, height, hash, err := capture.GrabPrimaryFrame(cfg.JPEGQuality, cfg.MaxWidth, lastHash)
 		if err != nil {
 			log.Printf("hostapp: capture failed: %v", err)
 			continue
+		}
+		lastHash = hash
+		if jpegBytes == nil {
+			continue // screen unchanged since last frame; nothing to send
 		}
 		bounds.width.Store(width)
 		bounds.height.Store(height)
@@ -325,17 +335,6 @@ func stopFrameRelay(sessionID string) {
 	}
 }
 
-// relayFrameDelay is the HTTP/MJPEG fallback's own capture interval,
-// independent of cfg.FrameDelay (the WebRTC path's rate). It's
-// deliberately more aggressive than the WebRTC default: this leg sends
-// raw binary frames with none of the DataChannel chunking overhead, and
-// the drop-stale-frame behavior throughout this path (see the
-// WriteBinary/time.Ticker comment below, and FrameBroadcaster.Publish)
-// means asking for more than the pipe can sustain just self-throttles
-// back down instead of building a backlog — so there's no real downside
-// to aiming high here.
-const relayFrameDelay = 33 * time.Millisecond // ~30fps target
-
 // runFrameRelayLoop pushes JPEG frames to the signaling server for the
 // HTTP/MJPEG fallback, independent of any WebRTC PeerConnection. Unlike
 // the WebRTC video path, this doesn't need an explicit buffered-amount
@@ -357,9 +356,10 @@ func runFrameRelayLoop(conn *safeConn, cfg Config, bounds *screenBounds, session
 	frameRelayMu.Unlock()
 	defer stopFrameRelay(sessionID)
 
-	ticker := time.NewTicker(relayFrameDelay)
+	ticker := time.NewTicker(cfg.FrameDelay)
 	defer ticker.Stop()
 
+	lastHash := capture.ForceEncode // force the first frame out regardless of screen content
 	log.Printf("hostapp: starting HTTP frame relay for session %s", sessionID)
 	for {
 		select {
@@ -367,10 +367,14 @@ func runFrameRelayLoop(conn *safeConn, cfg Config, bounds *screenBounds, session
 			log.Printf("hostapp: stopping HTTP frame relay for session %s", sessionID)
 			return
 		case <-ticker.C:
-			jpegBytes, width, height, err := capture.GrabPrimaryJPEG(cfg.JPEGQuality)
+			jpegBytes, width, height, hash, err := capture.GrabPrimaryFrame(cfg.JPEGQuality, cfg.MaxWidth, lastHash)
 			if err != nil {
 				log.Printf("hostapp: relay capture failed: %v", err)
 				continue
+			}
+			lastHash = hash
+			if jpegBytes == nil {
+				continue // screen unchanged since last frame; nothing to send
 			}
 			bounds.width.Store(width)
 			bounds.height.Store(height)

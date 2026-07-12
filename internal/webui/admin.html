@@ -200,12 +200,47 @@ const MODIFIER_CODES = new Set(["ControlLeft", "ControlRight", "AltLeft", "AltRi
 
 class SignalingClient {
   constructor(onSessionList, onAnswer, onScreenshot) {
-    const base = location.origin.replace(/^http/, "ws");
-    this.ws = new WebSocket(base + "/ws/viewer");
+    this.base = location.origin.replace(/^http/, "ws");
     this.onSessionList = onSessionList;
     this.onAnswer = onAnswer;
     this.onScreenshot = onScreenshot;
-    this.ws.onmessage = (ev) => this._handle(JSON.parse(ev.data));
+    this.onReady = null; // called on every (re)connect once the socket is open
+    this.onDisconnect = null; // called when an open socket drops
+    this._backoff = 500; // ms; grows to _maxBackoff on repeated failures
+    this._maxBackoff = 5000;
+    this._reconnectTimer = null;
+    this._connect();
+  }
+
+  // _connect opens the viewer WebSocket and, crucially, reopens it after
+  // any drop. Without this a transient network change — Wi-Fi handover, a
+  // VPN reconnecting, the laptop sleeping — permanently killed the whole
+  // UI: the socket closed and was never recreated, so the session list,
+  // HTTP-fallback input, and any hope of reconnecting all went dead until
+  // a manual page reload. The host side already retries forever; this is
+  // the browser side finally matching it.
+  _connect() {
+    const ws = new WebSocket(this.base + "/ws/viewer");
+    this.ws = ws;
+    ws.onmessage = (ev) => this._handle(JSON.parse(ev.data));
+    ws.onopen = () => {
+      this._backoff = 500; // reset on a successful connect
+      if (this.onReady) this.onReady();
+    };
+    ws.onclose = () => {
+      if (this.onDisconnect) this.onDisconnect();
+      this._scheduleReconnect();
+    };
+    // An errored socket also fires close; let onclose drive the reconnect
+    // so we don't schedule it twice.
+    ws.onerror = () => {};
+  }
+
+  _scheduleReconnect() {
+    clearTimeout(this._reconnectTimer);
+    const delay = this._backoff;
+    this._backoff = Math.min(this._backoff * 2, this._maxBackoff);
+    this._reconnectTimer = setTimeout(() => this._connect(), delay);
   }
 
   _handle(env) {
@@ -217,19 +252,28 @@ class SignalingClient {
     // along inside the offer/answer SDP itself.
   }
 
+  // _send drops the message if the socket isn't open (mid-reconnect),
+  // rather than throwing. Input events and list refreshes are fine to
+  // lose during a blip — the next ones arrive once the socket is back —
+  // and this keeps a stray send from throwing an uncaught exception while
+  // reconnecting.
+  _send(obj) {
+    if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj));
+  }
+
   requestSessionList() {
-    this.ws.send(JSON.stringify({ type: "list_sessions" }));
+    this._send({ type: "list_sessions" });
   }
 
   sendOffer(sessionId, sdp) {
-    this.ws.send(JSON.stringify({ type: "offer", session_id: sessionId, payload: { sdp } }));
+    this._send({ type: "offer", session_id: sessionId, payload: { sdp } });
   }
 
   // requestScreenshot asks the host for a single one-off preview JPEG —
   // no WebRTC session involved, just this WebSocket. Fine for a quick
   // "what's on that screen right now" peek from the session list.
   requestScreenshot(sessionId) {
-    this.ws.send(JSON.stringify({ type: "request_screenshot", session_id: sessionId }));
+    this._send({ type: "request_screenshot", session_id: sessionId });
   }
 
   // sendInputEvent/sendOverlayMessage carry mouse/keyboard/overlay
@@ -237,11 +281,11 @@ class SignalingClient {
   // DataChannel — used by the HTTP/MJPEG fallback transport, which has
   // no PeerConnection at all.
   sendInputEvent(sessionId, evt) {
-    this.ws.send(JSON.stringify({ type: "input_event", session_id: sessionId, payload: evt }));
+    this._send({ type: "input_event", session_id: sessionId, payload: evt });
   }
 
   sendOverlayMessage(sessionId, msg) {
-    this.ws.send(JSON.stringify({ type: "overlay_message", session_id: sessionId, payload: msg }));
+    this._send({ type: "overlay_message", session_id: sessionId, payload: msg });
   }
 }
 
@@ -273,8 +317,24 @@ class RemoteSession {
     this.signaling = signaling;
     this.session = session;
     this.onScreenFrame = onScreenFrame;
+    this.onConnectionLost = null; // set by the caller to drive recovery
+    this._lost = false;
     this.reassembler = new ScreenFrameReassembler();
     this.pc = new RTCPeerConnection({ iceServers: iceServers || [] });
+
+    // A PeerConnection does not heal itself after the network moves under
+    // it (VPN reconnect, Wi-Fi handover): ICE goes to "failed"/"closed"
+    // and stays there, with no more video, forever. Detect that and hand
+    // control back to the caller to rebuild the session, firing at most
+    // once per RemoteSession so a flurry of state changes can't kick off
+    // multiple overlapping reconnects.
+    this.pc.onconnectionstatechange = () => {
+      const st = this.pc.connectionState;
+      if ((st === "failed" || st === "disconnected" || st === "closed") && !this._lost) {
+        this._lost = true;
+        if (this.onConnectionLost) this.onConnectionLost();
+      }
+    };
 
     this.dcControl = this.pc.createDataChannel("control");
     this.dcControl.binaryType = "arraybuffer";
@@ -318,6 +378,9 @@ class RemoteSession {
   }
 
   close() {
+    // Mark lost first so pc.close()'s "closed" state change doesn't fire
+    // onConnectionLost — a deliberate close must never trigger recovery.
+    this._lost = true;
     this.dcControl.close();
     this.dcVideo.close();
     this.pc.close();
@@ -439,6 +502,38 @@ const signaling = new SignalingClient(
   (jpegBase64) => showScreenshotModal(jpegBase64)
 );
 
+// On every (re)connect of the signaling socket, refresh the session list
+// and — if a session is open — rebuild it. A reconnect almost always
+// means the network just changed (VPN, Wi-Fi, sleep), which is exactly
+// what leaves a stale WebRTC PeerConnection or a stalled MJPEG stream, so
+// rebuilding is the right default rather than assuming the old transport
+// survived.
+signaling.onReady = () => {
+  signaling.requestSessionList();
+  if (currentSession) reconnectActiveSession();
+};
+signaling.onDisconnect = () => {
+  if (currentSession) setStatus("⚠ соединение потеряно, переподключение…", "failed");
+};
+
+// reconnectActiveSession rebuilds whichever transport the open session is
+// using. Safe to call more than once (e.g. both the socket reopening and
+// the PeerConnection reporting failure can trigger it): connectWebRTC's
+// generation guard invalidates any older in-flight attempt, and closing
+// the previous RemoteSession first prevents a leak.
+function reconnectActiveSession() {
+  if (!currentSession) return;
+  if (transportMode === "http") {
+    // Cache-bust so the browser actually reopens the stream instead of
+    // reusing the dead connection.
+    els.screenHttp.src = "/stream/" + currentSession.session_id + "?t=" + Date.now();
+    setStatus("🟠 HTTP relay", "");
+    return;
+  }
+  if (remote) { remote.close(); remote = null; }
+  connectWebRTC();
+}
+
 function renderSessions() {
   els.sessions.innerHTML = "";
   for (const s of sessions) {
@@ -496,7 +591,19 @@ els.sidebar.addEventListener("mouseenter", revealSidebar);
 els.sidebar.addEventListener("mouseleave", scheduleHideSidebar);
 
 els.refresh.addEventListener("click", () => signaling.requestSessionList());
-signaling.ws.addEventListener("open", () => signaling.requestSessionList());
+
+// If the HTTP/MJPEG stream errors out (network blip, server restart)
+// while it's the active transport, reopen it after a short delay. The
+// WebRTC path has its own recovery via RemoteSession.onConnectionLost;
+// this is the equivalent for the fallback, which is just an <img> and
+// won't retry a dead multipart response on its own.
+els.screenHttp.addEventListener("error", () => {
+  if (transportMode === "http" && currentSession) {
+    setTimeout(() => {
+      if (transportMode === "http" && currentSession) reconnectActiveSession();
+    }, 1000);
+  }
+});
 
 els.shotBtn.addEventListener("click", () => {
   if (currentSession) signaling.requestScreenshot(currentSession.session_id);
@@ -519,6 +626,14 @@ async function connectWebRTC() {
   if (myGeneration !== transportGeneration || transportMode !== "webrtc") return;
 
   remote = new RemoteSession(signaling, currentSession, renderScreenFrame, iceServers);
+  remote.onConnectionLost = () => {
+    // Only recover if this is still the active session on the WebRTC
+    // transport — not a stale peer whose failure raced a manual switch.
+    if (myGeneration === transportGeneration && transportMode === "webrtc" && currentSession) {
+      setStatus("⚠ соединение потеряно, переподключение…", "failed");
+      reconnectActiveSession();
+    }
+  };
   remote.connect();
   connectTimeoutHandle = setTimeout(() => {
     if (myGeneration !== transportGeneration) return;

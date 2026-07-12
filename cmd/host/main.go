@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"rdpAiAnswer/internal/hostapp"
 )
@@ -71,11 +72,17 @@ func main() {
 	iceServers := flag.String("ice-servers", defaultICEServers, "comma-separated STUN/TURN URLs, e.g. stun:vps:3478,turn:vps:3478")
 	turnUsername := flag.String("turn-username", defaultTURNUsername, "TURN username, if any TURN URL is passed in -ice-servers")
 	turnCredential := flag.String("turn-credential", defaultTURNCredential, "TURN credential, if any TURN URL is passed in -ice-servers")
+	fps := flag.Int("fps", 30, "target frames per second for the live stream (both WebRTC and HTTP fallback)")
+	quality := flag.Int("quality", 75, "JPEG quality 1-100; higher is sharper but larger/slower")
+	maxWidth := flag.Int("max-width", 0, "downscale captures to at most this width in pixels for speed; 0 = native resolution")
 	flag.Parse()
 
-	cfg := hostapp.Config{SignalingURL: *server, Name: *name, ICEUsername: *turnUsername, ICECredential: *turnCredential}
+	cfg := hostapp.Config{SignalingURL: *server, Name: *name, ICEUsername: *turnUsername, ICECredential: *turnCredential, JPEGQuality: *quality, MaxWidth: *maxWidth}
 	if *iceServers != "" {
 		cfg.ICEServers = strings.Split(*iceServers, ",")
+	}
+	if *fps > 0 {
+		cfg.FrameDelay = time.Second / time.Duration(*fps)
 	}
 
 	log.Printf("connecting to %s as %q", cfg.SignalingURL, cfg.Name)
