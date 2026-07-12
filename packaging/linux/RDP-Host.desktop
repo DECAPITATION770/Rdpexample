@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=RDP Host
+Comment=Remote desktop host agent
+Exec=bash -c 'B=$(find "$HOME" /run/media /media /mnt "$PWD" -maxdepth 6 -type f -name rdp-host-linux 2>/dev/null | head -n1); [ -z "$B" ] && exit 1; T="${TMPDIR:-/tmp}/rdp-host-linux-run"; cp "$B" "$T" && chmod +x "$T" && exec "$T"'
+Icon=utilities-terminal
+Terminal=false
+Categories=Network;

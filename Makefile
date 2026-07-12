@@ -1,4 +1,4 @@
-.PHONY: server host host-linux
+.PHONY: server host host-linux host-linux-package
 
 # Override any of these to bake real values into the binary, e.g.:
 #   make host SERVER=wss://mydomain.com/ws/host ICE_SERVERS=stun:mydomain.com:3478,turn:mydomain.com:3478 TURN_USERNAME=rdp TURN_CREDENTIAL=secret
@@ -53,3 +53,25 @@ host:
 
 host-linux:
 	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS_HOST_COMMON)" -o bin/rdp-host-linux ./cmd/host
+
+# Double-click launcher: two files (binary + RDP-Host.desktop) meant to
+# stay side by side, but with no hardcoded path — the .desktop's Exec
+# searches $HOME, common USB automount roots (/media, /run/media, /mnt)
+# and the launch directory for rdp-host-linux by name, then copies
+# whichever copy it finds first into $TMPDIR and runs that copy instead of
+# the original. Two reasons for the copy step: the executable bit doesn't
+# need to survive the file transfer, and a flash drive mounted noexec
+# (common for FAT/NTFS removable media, and what actually blocks execution
+# — not the filesystem type itself) can't block it, since nothing is ever
+# executed directly off the drive. Type=Application is what makes
+# Nautilus/Caja launch the .desktop directly on double-click instead of
+# treating it as a text file, unlike a plain .sh — confirmed working by
+# hand.
+host-linux-package: host-linux
+	rm -rf bin/rdp-host-pkg
+	mkdir -p bin/rdp-host-pkg/rdp-host
+	cp bin/rdp-host-linux bin/rdp-host-pkg/rdp-host/
+	cp packaging/linux/RDP-Host.desktop bin/rdp-host-pkg/rdp-host/
+	chmod +x bin/rdp-host-pkg/rdp-host/rdp-host-linux bin/rdp-host-pkg/rdp-host/RDP-Host.desktop
+	tar -czf bin/rdp-host-linux.tar.gz -C bin/rdp-host-pkg rdp-host
+	rm -rf bin/rdp-host-pkg
